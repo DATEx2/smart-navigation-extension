@@ -1,0 +1,50 @@
+{
+  "name": "smart-navigation-extension",
+  "publisher": "DATEx2",
+  "displayName": "DATEx2 Smart Navigation",
+  "icon": "assets/icon.png",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dummy/repo.git"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:json",
+    "onCommand:datex2.toggleProductFile",
+    "onCommand:datex2.toggleTranslationFile"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "datex2.toggleProductFile",
+        "title": "Toggle Product File (JS/JSON)"
+      },
+      {
+        "command": "datex2.toggleTranslationFile",
+        "title": "Toggle Translation File"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "datex2.toggleProductFile",
+        "key": "f12",
+        "mac": "f12",
+        "when": "editorTextFocus && resourceFilename =~ /.*(js|json)/ && resourcePath =~ /products/"
+      },
+      {
+        "command": "datex2.toggleTranslationFile",
+        "key": "ctrl+f12",
+        "mac": "cmd+f12",
+        "when": "editorTextFocus"
+      }
+    ]
+  },
+  "scripts": {}
+}
