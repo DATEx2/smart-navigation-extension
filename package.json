@@ -2,7 +2,7 @@
   "name": "smart-navigation-extension",
   "publisher": "DATEx2",
   "displayName": "DATEx2 Smart Navigation",
-  "icon": "assets/icon.png",
+  "icon": "assets/icon.webp",
   "version": "0.1.0",
   "repository": {
     "type": "git",

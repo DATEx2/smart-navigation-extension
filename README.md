@@ -10,7 +10,7 @@ This extension provides smart navigation features for DATEx2 development.
 *   Instantly opens the counterpart file (`.js` <-> `.json`).
 *   **Smart Context Awareness:** Preserves cursor position within keys and values.
 
-<img src="assets/icon.png" alt="F12 Toggle Infographic" width="100%"/>
+<img src="assets/icon.webp" alt="F12 Toggle Infographic" width="100%"/>
 
 ### 2. Translation Cache Toggle (Ctrl+F12)
 *   **Press Ctrl+F12** on a text string or key in any file to jump to its entry in `translations.ai.cache.json`.
