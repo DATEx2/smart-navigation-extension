@@ -61,9 +61,11 @@ function activate(context) {
     }
 
     async function updateStatusBar() {
-        const productFiles = await vscode.workspace.findFiles('website/db/api/products/**/*.js', '**/node_modules/**');
+        const productFiles = await vscode.workspace.findFiles('tools/ecwid/db/products/**/*.js', '**/node_modules/**');
         let total = 0;
         let missing = 0;
+        let cacheMissing = 0;
+        let cacheTotal = 0;
 
         for (const file of productFiles) {
             try {
@@ -90,17 +92,107 @@ function activate(context) {
             } catch (e) { console.error(e); }
         }
 
-        const percent = total > 0 ? Math.round(((total - missing) / total) * 100) : 100;
-        missingItem.text = `${missing} (${percent}%)`; 
-        missingItem.color = missing > 0 ? '#FFFF00' : '#FFFFFF';
+        // Check cache file
+        try {
+            const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+                ? vscode.workspace.workspaceFolders[0].uri.fsPath
+                : '';
+            if (rootPath) {
+                const cachePath = path.join(rootPath, 'website/db/translations/translations.ai.cache.json');
+                if (fs.existsSync(cachePath)) {
+                    const cacheContent = fs.readFileSync(cachePath, 'utf8');
+                    const cacheJson = JSON.parse(cacheContent);
+                    const keys = Object.keys(cacheJson);
+                    cacheTotal = keys.length;
+                    
+                    let mCount = 0;
+                    for (const k of keys) {
+                        if (!k.endsWith(' ')) {
+                            mCount++;
+                        }
+                        
+                        const v = cacheJson[k];
+                        if (v && typeof v === 'object') {
+                            for (const lang of Object.keys(v)) {
+                                if (lang === 'cy' || lang === 'refs') continue;
+                                const t = v[lang];
+                                if (typeof t === 'string' && !t.endsWith(' ')) {
+                                    mCount++;
+                                }
+                            }
+                        }
+                    }
+                    cacheMissing = mCount;
+                }
+            }
+        } catch (e) { console.error('Error reading translation cache:', e); }
+
+        const combinedTotal = total + cacheTotal;
+        const combinedMissing = missing + cacheMissing;
+        const percent = combinedTotal > 0 ? Math.round(((combinedTotal - combinedMissing) / combinedTotal) * 100) : 100;
+        
+        missingItem.text = `${combinedMissing} (${percent}%)`; 
+        missingItem.color = combinedMissing > 0 ? '#FFFF00' : '#FFFFFF';
+        missingItem.tooltip = `Products: ${missing} missing, Cache: ${cacheMissing} missing`;
         missingItem.show();
         percentItem.hide();
     }
 
+    // Helper for cache missing entries (keys with no trailing space)
+    function getMissingCacheEntries(content) {
+        const entries = [];
+        
+        // 1. Check Top-Level Keys (Lines like "Key": { )
+        const keysRegex = /"((?:[^"\\]|\\.)*)"\s*:\s*\{/g;
+        let match;
+        while ((match = keysRegex.exec(content)) !== null) {
+            const key = match[1];
+            if (!key.endsWith(' ')) {
+                const start = match.index + 1; 
+                const end = start + key.length;
+                entries.push({ start, end, val: key });
+            }
+        }
+
+        // 2. Check Values (Lines like "lang": "Value")
+        // Exclude 'cy' and 'refs'
+        const valuesRegex = /"([^"\\]+)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+        while ((match = valuesRegex.exec(content)) !== null) {
+            const prop = match[1];
+            const val = match[2];
+            
+            if (prop === 'cy' || prop === 'refs') continue;
+
+            if (!val.endsWith(' ')) {
+                 // Determine value location
+                 const colonIdx = match[0].indexOf(':');
+                 const valQuoteStart = match[0].indexOf('"', colonIdx + 1);
+                 const valStartInMatch = valQuoteStart + 1;
+                 
+                 const start = match.index + valStartInMatch;
+                 const end = start + val.length;
+                 entries.push({ start, end, val: val });
+            }
+        }
+        
+        return entries.sort((a,b) => a.start - b.start);
+    }
+
     context.subscriptions.push(vscode.commands.registerCommand('datex2.showMissingTranslations', async () => {
         // Find ALL product files, sort them
-        const productFiles = (await vscode.workspace.findFiles('website/db/api/products/**/*.js', '**/node_modules/**'))
+        const productFiles = (await vscode.workspace.findFiles('tools/ecwid/db/products/**/*.js', '**/node_modules/**'))
             .sort((a, b) => a.fsPath.localeCompare(b.fsPath));
+        
+        // Append cache file if exists
+        const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+            ? vscode.workspace.workspaceFolders[0].uri.fsPath
+            : null;
+        if (rootPath) {
+            const cachePath = path.join(rootPath, 'website/db/translations/translations.ai.cache.json');
+            if (fs.existsSync(cachePath)) {
+                productFiles.push(vscode.Uri.file(cachePath));
+            }
+        }
 
         if (productFiles.length === 0) return;
 
@@ -117,14 +209,17 @@ function activate(context) {
                 startOffset = editor.document.offsetAt(editor.selection.active);
             } else {
                 // Detect based on folder: Find product file that is in a parent directory of current file
-                const matches = productFiles.map((f, i) => ({ i, dir: path.dirname(f.fsPath) }))
-                    .filter(m => currentPath.startsWith(m.dir + path.sep) || currentPath === m.dir);
-                
-                if (matches.length > 0) {
-                    // Sort by length desc to get deepest matching folder (closest parent)
-                    matches.sort((a, b) => b.dir.length - a.dir.length);
-                    startFileIndex = matches[0].i;
-                    startOffset = -1; // Start from the beginning of the file
+                // But skip this logic if we are in cache file (already handled by exactIdx usually, or falls through)
+                if (!currentPath.endsWith('translations.ai.cache.json')) {
+                    const matches = productFiles.map((f, i) => ({ i, dir: path.dirname(f.fsPath) }))
+                        .filter(m => currentPath.startsWith(m.dir + path.sep) || currentPath === m.dir);
+                    
+                    if (matches.length > 0) {
+                        // Sort by length desc to get deepest matching folder (closest parent)
+                        matches.sort((a, b) => b.dir.length - a.dir.length);
+                        startFileIndex = matches[0].i;
+                        startOffset = -1; // Start from the beginning of the file
+                    }
                 }
             }
         }
@@ -135,35 +230,16 @@ function activate(context) {
             const fileIdx = (startFileIndex + i) % productFiles.length;
             const file = productFiles[fileIdx];
             
-            // If we are looking at the start file again (after wrapping), effectively we checked everything?
-            // Wait, we need to check (start file > offset) -> (next files) -> (start file from 0 to offset).
-            // Simplified: Just iterate files in order. 
-            // 1. Current File (after offset)
-            // 2. Next Files (full)
-            // 3. Prev Files (full) -> up to Current File (before offset)
-            
-            // Let's just process the file content, get missing entries.
-            // Then filter based on offset if it's the current file match.
-            
+            const isCacheFile = file.fsPath.endsWith('translations.ai.cache.json');
             const content = fs.readFileSync(file.fsPath, 'utf8');
-            const entries = getMissingEntries(content);
+            const entries = isCacheFile ? getMissingCacheEntries(content) : getMissingEntries(content);
             
             if (entries.length === 0) continue;
 
             let targetEntry = null;
 
             if (fileIdx === startFileIndex) {
-                // If it's the file we validly started in (or returned to)
-                // We want: 
-                // A) if we are in the 'first pass' (i=0), find entry > startOffset
-                // B) if we wrapped around (i > 0 which means we looped all others), we typically search from 0.
-                // But loop condition `i < productFiles.length` means we visit each file ONCE.
-                // So if we visit StartFile at i=0, we look > offset.
-                // If we don't find it, we proceed to others.
-                // If we finish loop, we haven't checked StartFile < offset!
-                
-                // Correction: loop `i < productFiles.length * 2`? Or logic to split StartFile?
-                
+               
                 // Simplest: Find first entry > startOffset.
                 targetEntry = entries.find(e => e.start > startOffset);
             } else {
@@ -187,12 +263,12 @@ function activate(context) {
         // Check start of start file
         if (startOffset > -1) {
              const file = productFiles[startFileIndex];
+             const isCacheFile = file.fsPath.endsWith('translations.ai.cache.json');
              const content = fs.readFileSync(file.fsPath, 'utf8');
-             const entries = getMissingEntries(content);
-             const targetEntry = entries.find(e => e.start < startOffset); // Just first one really, or one before offset?
-             // Usually wrapping around means "Next" finds nothing, so go to the very first missing in the file globally.
+             const entries = isCacheFile ? getMissingCacheEntries(content) : getMissingEntries(content);
+             
+             // Wrap around check: Find first entry (lowest offset)
              if (entries.length > 0) {
-                  // Just take the first one in the file -> wrapping complete.
                  const targetEntry = entries[0];
                  const doc = await vscode.workspace.openTextDocument(file);
                  const ed = await vscode.window.showTextDocument(doc);
@@ -203,6 +279,7 @@ function activate(context) {
                  return;
              }
         }
+
 
         vscode.window.showInformationMessage('No missing translations found!');
     }));
@@ -216,6 +293,13 @@ function activate(context) {
             updateStatusBar();
         }
     }));
+
+    // Watch for translation cache changes
+    const cacheWatcher = vscode.workspace.createFileSystemWatcher('**/website/db/translations/translations.ai.cache.json');
+    cacheWatcher.onDidChange(updateStatusBar);
+    cacheWatcher.onDidCreate(updateStatusBar);
+    cacheWatcher.onDidDelete(updateStatusBar);
+    context.subscriptions.push(cacheWatcher);
     
     // --- End Translation Status Bar Logic ---
     const provider = {
@@ -294,6 +378,56 @@ function activate(context) {
                 }
             }
             outputChannel.appendLine(`Found ${links.length} links.`);
+
+            // --- Custom DATEx2 Link Logic ---
+            // Matches format: "profile:494@..." or "products/Slug:60@..."
+            const customRegex = /(?:["'])(profile|categories|products\/[\w-]+):(\d+)(?:@([^"']+))?(?:["'])/g;
+            let customMatch;
+            while ((customMatch = customRegex.exec(text))) {
+                // customMatch[0] includes quotes, we need to adjust positions
+                const fullMatchStr = customMatch[0];
+                const identifier = customMatch[1]; // profile, categories, products/Slug
+                const lineNum = parseInt(customMatch[2]);
+                const contextPath = customMatch[3]; // optional context path
+
+                // Determine file path based on identifier
+                let relativePath = '';
+                if (identifier === 'profile') {
+                    relativePath = 'tools/ecwid/db/profile.json';
+                } else if (identifier === 'categories') {
+                    relativePath = 'tools/ecwid/db/categories.json';
+                } else if (identifier.startsWith('products/')) {
+                    const slug = identifier.split('/')[1];
+                    // standard path: tools/ecwid/db/products/Slug/Slug.js
+                    // But check if it exists, otherwise maybe json
+                    // We assume standard structure for speed, or check fs
+                    relativePath = `tools/ecwid/db/products/${slug}/${slug}.js`;
+                }
+
+                if (relativePath) {
+                     // Resolve absolute path
+                     const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
+                     if (rootPath) {
+                         const absPath = path.join(rootPath, relativePath);
+                         
+                         // Check existence (optional but specific for products might be needed if .js vs .json var)
+                         // For now assume .js for products as per user style
+                         
+                         const targetUri = vscode.Uri.file(absPath).with({ fragment: `L${lineNum}` });
+                         
+                         // Calculate range inside the quotes
+                         // match index is starting quote
+                         const matchIndex = customMatch.index; 
+                         const startPos = document.positionAt(matchIndex + 1); // skip quote
+                         const endPos = document.positionAt(matchIndex + fullMatchStr.length - 1); // skip end quote
+                         
+                         const link = new vscode.DocumentLink(new vscode.Range(startPos, endPos), targetUri);
+                         link.tooltip = `Open ${relativePath} at line ${lineNum}`;
+                         links.push(link);
+                     }
+                }
+            }
+
             return links;
         }
     };
