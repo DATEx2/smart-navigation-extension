@@ -1,9 +1,223 @@
 const vscode = require('vscode');
 const path = require('path');
+const fs = require('fs');
 
 const outputChannel = vscode.window.createOutputChannel("Path Expander Debug");
 
 function activate(context) {
+    // --- Translation Status Bar Logic ---
+    const missingItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    const percentItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
+    context.subscriptions.push(missingItem);
+    context.subscriptions.push(percentItem);
+
+    missingItem.command = 'datex2.showMissingTranslations';
+    percentItem.command = 'datex2.showMissingTranslations';
+    missingItem.tooltip = "Click to go to next missing translation";
+    percentItem.tooltip = "Translation progress";
+
+    missingItem.text = "$(sync~spin) ...";
+    missingItem.show();
+    percentItem.text = "%";
+    percentItem.show();
+
+    // Helper to extract missing entries from content
+    function getMissingEntries(content) {
+        const entries = [];
+        // Keys that need translation
+        const baseKeys = ['name', 'seoTitle', 'seoDescription', 'description', 'text', 'value'];
+        const keysPatternStr = `(?:\\w*Translated)|${baseKeys.join('|')}`;
+        // Regex to find keys: key: "value" or "key": "value"
+        // Captures: 1=Key, 2=Quote, 3=Value
+        const keyPattern = new RegExp(`(?:^|\\s|,|{)(?:["']?)(${keysPatternStr})(?:["']?)\\s*:\\s*(["'])((?:(?!\\2)[^\\\\]|\\\\.)*?)\\2`, 'g');
+        const loadPattern = /load\(\s*(["'])((?:(?!\1)[^\\]|\\.)*?)\1\s*\)/g;
+
+        let match;
+        while ((match = keyPattern.exec(content)) !== null) {
+            const quote = match[2];
+            const val = match[3];
+            if (!val.endsWith(' ') && val.length > 0) {
+                // Determine start position using length from end (robust for escaped quotes)
+                // match[0] ends with the closing quote \2
+                // val is immediately before that closing quote
+                // so val start is: matchEnd - 1 (quote) - valLength
+                const valStartRel = match[0].length - 1 - val.length;
+                const absStart = match.index + valStartRel;
+                entries.push({ start: absStart, end: absStart + val.length, val });
+            }
+        }
+
+        while ((match = loadPattern.exec(content)) !== null) {
+            const quote = match[1];
+            const val = match[2];
+            if (!val.endsWith(' ') && val.length > 0) {
+                // For load(), the first quote is the opening one
+                const valStartInMatch = match[0].indexOf(quote) + 1;
+                const absStart = match.index + valStartInMatch;
+                entries.push({ start: absStart, end: absStart + val.length, val });
+            }
+        }
+        return entries.sort((a,b) => a.start - b.start);
+    }
+
+    async function updateStatusBar() {
+        const productFiles = await vscode.workspace.findFiles('website/db/api/products/**/*.js', '**/node_modules/**');
+        let total = 0;
+        let missing = 0;
+
+        for (const file of productFiles) {
+            try {
+                const content = fs.readFileSync(file.fsPath, 'utf8');
+                
+                // Count Totals (Candidates)
+                const baseKeys = ['name', 'seoTitle', 'seoDescription', 'description', 'text', 'value'];
+                const keysPatternStr = `(?:\\w*Translated)|${baseKeys.join('|')}`;
+                const keyPattern = new RegExp(`(?:^|\\s|,|{)(?:["']?)(${keysPatternStr})(?:["']?)\\s*:\\s*(["'])((?:(?!\\2)[^\\\\]|\\\\.)*?)\\2`, 'g');
+                const loadPattern = /load\(\s*(["'])((?:(?!\1)[^\\]|\\.)*?)\1\s*\)/g;
+                
+                let m;
+                while ((m = keyPattern.exec(content)) !== null) {
+                    if(m[3].length > 0) total++;
+                }
+                while ((m = loadPattern.exec(content)) !== null) {
+                     if(m[2].length > 0) total++;
+                }
+
+                // Count Missing
+                const missingEntries = getMissingEntries(content);
+                missing += missingEntries.length;
+
+            } catch (e) { console.error(e); }
+        }
+
+        const percent = total > 0 ? Math.round(((total - missing) / total) * 100) : 100;
+        missingItem.text = `${missing} (${percent}%)`; 
+        missingItem.color = missing > 0 ? '#FFFF00' : '#FFFFFF';
+        missingItem.show();
+        percentItem.hide();
+    }
+
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.showMissingTranslations', async () => {
+        // Find ALL product files, sort them
+        const productFiles = (await vscode.workspace.findFiles('website/db/api/products/**/*.js', '**/node_modules/**'))
+            .sort((a, b) => a.fsPath.localeCompare(b.fsPath));
+
+        if (productFiles.length === 0) return;
+
+        const editor = vscode.window.activeTextEditor;
+        let startFileIndex = 0;
+        let startOffset = -1;
+
+        if (editor) {
+            const currentPath = editor.document.fileName;
+            const exactIdx = productFiles.findIndex(f => f.fsPath === currentPath);
+
+            if (exactIdx !== -1) {
+                startFileIndex = exactIdx;
+                startOffset = editor.document.offsetAt(editor.selection.active);
+            } else {
+                // Detect based on folder: Find product file that is in a parent directory of current file
+                const matches = productFiles.map((f, i) => ({ i, dir: path.dirname(f.fsPath) }))
+                    .filter(m => currentPath.startsWith(m.dir + path.sep) || currentPath === m.dir);
+                
+                if (matches.length > 0) {
+                    // Sort by length desc to get deepest matching folder (closest parent)
+                    matches.sort((a, b) => b.dir.length - a.dir.length);
+                    startFileIndex = matches[0].i;
+                    startOffset = -1; // Start from the beginning of the file
+                }
+            }
+        }
+
+        // Loop files starting from current
+        for (let i = 0; i < productFiles.length; i++) {
+            // Logic to wrap around: (start + i) % length
+            const fileIdx = (startFileIndex + i) % productFiles.length;
+            const file = productFiles[fileIdx];
+            
+            // If we are looking at the start file again (after wrapping), effectively we checked everything?
+            // Wait, we need to check (start file > offset) -> (next files) -> (start file from 0 to offset).
+            // Simplified: Just iterate files in order. 
+            // 1. Current File (after offset)
+            // 2. Next Files (full)
+            // 3. Prev Files (full) -> up to Current File (before offset)
+            
+            // Let's just process the file content, get missing entries.
+            // Then filter based on offset if it's the current file match.
+            
+            const content = fs.readFileSync(file.fsPath, 'utf8');
+            const entries = getMissingEntries(content);
+            
+            if (entries.length === 0) continue;
+
+            let targetEntry = null;
+
+            if (fileIdx === startFileIndex) {
+                // If it's the file we validly started in (or returned to)
+                // We want: 
+                // A) if we are in the 'first pass' (i=0), find entry > startOffset
+                // B) if we wrapped around (i > 0 which means we looped all others), we typically search from 0.
+                // But loop condition `i < productFiles.length` means we visit each file ONCE.
+                // So if we visit StartFile at i=0, we look > offset.
+                // If we don't find it, we proceed to others.
+                // If we finish loop, we haven't checked StartFile < offset!
+                
+                // Correction: loop `i < productFiles.length * 2`? Or logic to split StartFile?
+                
+                // Simplest: Find first entry > startOffset.
+                targetEntry = entries.find(e => e.start > startOffset);
+            } else {
+                targetEntry = entries[0];
+            }
+
+            if (targetEntry) {
+                // Found one!
+                const doc = await vscode.workspace.openTextDocument(file);
+                const ed = await vscode.window.showTextDocument(doc);
+                const pos = ed.document.positionAt(targetEntry.start);
+                // Select the content
+                const endPos = ed.document.positionAt(targetEntry.end);
+                ed.selection = new vscode.Selection(pos, endPos);
+                ed.revealRange(new vscode.Range(pos, endPos), vscode.TextEditorRevealType.InCenter);
+                return;
+            }
+        }
+        
+        // If we only looped once, we missed the start of the start file.
+        // Check start of start file
+        if (startOffset > -1) {
+             const file = productFiles[startFileIndex];
+             const content = fs.readFileSync(file.fsPath, 'utf8');
+             const entries = getMissingEntries(content);
+             const targetEntry = entries.find(e => e.start < startOffset); // Just first one really, or one before offset?
+             // Usually wrapping around means "Next" finds nothing, so go to the very first missing in the file globally.
+             if (entries.length > 0) {
+                  // Just take the first one in the file -> wrapping complete.
+                 const targetEntry = entries[0];
+                 const doc = await vscode.workspace.openTextDocument(file);
+                 const ed = await vscode.window.showTextDocument(doc);
+                 const pos = ed.document.positionAt(targetEntry.start);
+                 const endPos = ed.document.positionAt(targetEntry.end);
+                 ed.selection = new vscode.Selection(pos, endPos);
+                 ed.revealRange(new vscode.Range(pos, endPos), vscode.TextEditorRevealType.InCenter);
+                 return;
+             }
+        }
+
+        vscode.window.showInformationMessage('No missing translations found!');
+    }));
+
+    // Initial update
+    updateStatusBar();
+    
+    // Watch for saves
+    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument((doc) => {
+        if (doc.fileName.endsWith('.js') && doc.fileName.includes('products')) {
+            updateStatusBar();
+        }
+    }));
+    
+    // --- End Translation Status Bar Logic ---
     const provider = {
         provideDocumentLinks(document, token) {
             outputChannel.appendLine(`[${new Date().toISOString()}] ProvideDocumentLinks called for: ${document.fileName}`);
@@ -182,6 +396,100 @@ function activate(context) {
         return identities;
     }
 
+    // Helper: If cursor is within a stringified JSON object (like "{id:123,p:456}"),
+    // extract which property the cursor is on
+    function extractSubPropertyFromString(lineText, cursorCol) {
+        //Find the value portion (after the colon)
+        const colonIdx = lineText.indexOf(':');
+        if (colonIdx === -1) return null;
+        
+        const valuePortion = lineText.substring(colonIdx + 1).trim();
+        // Check if it looks like a stringified object (starts with "{)
+       const valueStart = lineText.indexOf('{', colonIdx);
+        if (valueStart === -1 || cursorCol < valueStart) return null;
+        
+        // Calculate position within the stringified object
+        const relativePos = cursorCol - valueStart;
+        
+        // Extract the string (till closing }  or end of string)
+        let objString = '';
+        let depth = 0;
+        for (let i = valueStart; i < lineText.length; i++) {
+            const ch = lineText[i];
+            if (ch === '{') depth++;
+            if (ch === '}') {
+                depth--;
+                objString += ch;
+                if (depth === 0) break;
+            } else {
+                objString += ch;
+            }
+        }
+        
+        if (objString.length === 0) return null;
+        
+        // Now parse the object string to find properties
+       // Match patterns like: id:123, or p:'text', or s:"text"
+        const propRegex = /(\w+)\s*:/g;
+        let match;
+        let properties = [];
+        
+        while ((match = propRegex.exec(objString)) !== null) {
+            const propKey = match[1];
+            const propStartIdx = match.index; // Position of key start in objString
+            const colonPos = match.index + match[0].length - 1; // Position of ':'
+            
+            // Find where the value ends (next comma or closing brace)
+            let valueEnd = objString.length;
+            let searchFrom = colonPos + 1;
+            let inQuote = false;
+            let quoteChar = null;
+            
+            for (let i = searchFrom; i < objString.length; i++) {
+                const ch = objString[i];
+                if (!inQuote && (ch === '"' || ch === "'")) {
+                    inQuote = true;
+                    quoteChar = ch;
+                } else if (inQuote && ch === quoteChar && objString[i-1] !== '\\') {
+                    inQuote = false;
+                } else if (!inQuote && (ch === ',' || ch === '}')) {
+                    valueEnd = i;
+                    break;
+                }
+            }
+            
+            properties.push({
+                key: propKey,
+                startIdx: propStartIdx,
+                colonIdx: colonPos,
+                valueEndIdx: valueEnd
+            });
+        }
+        
+        // Find which property the cursor is on
+        for (let prop of properties) {
+            // Cursor on key (before colon)
+            if (relativePos >= prop.startIdx && relativePos < prop.colonIdx) {
+                return {
+                    key: prop.key,
+                    keyStartCol: valueStart + prop.startIdx
+                };
+            }
+            // Cursor on value
+            if (relativePos >= prop.colonIdx + 1 && relativePos <= prop.valueEndIdx) {
+                const valStart = prop.colonIdx + 1;
+                const valOffset = Math.max(0, relativePos - valStart);
+                return {
+                    key: prop.key,
+                    valStartCol: valueStart + valStart,
+                    valOffset: valOffset
+                };
+            }
+        }
+        
+        return null;
+    }
+
     function getContextStack(parsedLines, lineIdx, cache) {
         let stack = [];
         let currentLineIdx = lineIdx;
@@ -353,13 +661,31 @@ function activate(context) {
                         if (item.key) {
                             // Flexible regex for keys: \"key\", "key", 'key', key
                             // (?:\\\"|[\"']?): optional escaped quote OR normal quote OR nothing
-                            const keyPattern = '(?:\\\\\\"|["\']?)' + item.key + '(?:\\\\\\"|["\']?)\\s*:';
+                            const keyPattern = '(?:\\\\\\\\\\\\"|["\']?)' + item.key + '(?:\\\\\\\\\\\\"|["\']?)\\s*:';
                             const regex = new RegExp(keyPattern);
                             const match = regex.exec(textToSearch.substring(currentBase));
                             
                             if (match) {
                                 const idx = currentBase + match.index;
                                 currentBase = idx + match[0].length;
+                                // We want to land on the value or the key? User said "appropriate character".
+                                // Usually finding the key is good.
+                                extraOffset = idx; 
+                                
+                                // Refine extraOffset to point to the key text start, not quote
+                                // match[0] is full match e.g. "id":
+                                // We want index of 'id'.
+                                const subMatch = match[0].match(new RegExp(item.key));
+                                if (subMatch) {
+                                     extraOffset = idx + subMatch.index;
+                                }
+                            } else {
+                                // Fallback
+                                const idx = textToSearch.indexOf(item.key, currentBase);
+                                if (idx !== -1) {
+                                    currentBase = idx + item.key.length;
+                                    extraOffset = idx; 
+                                } else {
                                     foundAll = false; 
                                 }
                             }
@@ -375,8 +701,9 @@ function activate(context) {
                 if (isValueFocus) {
                      const vMatch = line.txt.match(/:\s*(?:["']?)/);
                      if (vMatch && vMatch.index) {
-                         const targetValStart = vMatch.index + vMatch[0].length + 1;
-                         col = targetValStart + (leaf.valOffset || 0);
+                         const baseStart = vMatch.index + vMatch[0].length;
+                         const offset = leaf.valOffset || 0;
+                         col = baseStart + offset + 1; // 1‑based column
                      } else {
                          col = line.txt.length + 1;
                      }
@@ -416,8 +743,113 @@ function activate(context) {
 
         if (!filePath) return;
 
-        const dir = path.dirname(filePath);
+        const currentLineText = document.lineAt(selection.line).text;
+        
+        // 1. Navigation from JS/JSON -> HTML (on load('...'))
+        // 1. Navigation from JS/JSON -> HTML (on load('...'))
+        const loadMatch = currentLineText.match(/load\(\s*(['"])((?:(?!\1)[^\\]|\\.)*?)\1\s*\)/);
+        if (loadMatch) {
+            // Check if cursor is within the load(...) call
+            const loadStart = loadMatch.index;
+            const loadEnd = loadStart + loadMatch[0].length;
+            
+            const cursorCol = selection.character;
+            
+            if (cursorCol >= loadStart && cursorCol <= loadEnd) {
+                const relPath = loadMatch[2].trim();
+                const dir = path.dirname(filePath);
+                const htmlPath = path.join(dir, relPath);
+                
+                if (fs.existsSync(htmlPath)) {
+                    const doc = await vscode.workspace.openTextDocument(htmlPath);
+                    await vscode.window.showTextDocument(doc);
+                    return;
+                } else {
+                    vscode.window.showWarningMessage(`Could not find HTML file: ${htmlPath}`);
+                }
+            }
+        }
+
+        // 2. Navigation from HTML -> JS (Find where this file is loaded)
         const ext = path.extname(filePath);
+        if (ext === '.html') {
+             // Look for product.js in parent directories
+             let currentDir = path.dirname(filePath);
+             let foundProductFile = null;
+             
+             // Go up at most 3 levels to find product.js or similar
+             for (let i = 0; i < 3; i++) {
+                 const pjs = path.join(currentDir, 'product.js');
+                 if (fs.existsSync(pjs)) {
+                     foundProductFile = pjs;
+                     break;
+                 }
+                 // Try looking for named product file like BCx3-220VAC.js
+                 const files = fs.readdirSync(currentDir);
+                 const namedJs = files.find(f => f.endsWith('.js') && !f.startsWith('.'));
+                 if (namedJs) {
+                     // Check if this JS file loads our HTML file
+                     const candidate = path.join(currentDir, namedJs);
+                     const content = fs.readFileSync(candidate, 'utf8');
+                     // We need to see if it loads the relative path to our HTML file
+                     // Calculate relative path from candidate to filePath
+                     // e.g. candidate: .../BCx3-220VAC.js, filePath: .../attributes/ChargingSpeedA.html
+                     // rel: attributes/ChargingSpeedA.html
+                     
+                     // It might be loaded with different spacing or quotes, so let's rely on filename matching broadly or strict relative path
+                     const relFromCand = path.relative(path.dirname(candidate), filePath).replace(/\\/g, '/');
+                     
+                     if (content.includes(relFromCand) || content.includes(path.basename(filePath))) {
+                        foundProductFile = candidate;
+                        break;
+                     }
+                 }
+                 currentDir = path.dirname(currentDir);
+             }
+             
+             if (foundProductFile) {
+                 const doc = await vscode.workspace.openTextDocument(foundProductFile);
+                 const text = doc.getText();
+                 
+                 // We want to find the exact load() call for this HTML file
+                 // relPath might be "attributes/ChargingSpeedA.html"
+                 // usage: load('attributes/ChargingSpeedA.html ') or similar
+                 const relPath = path.relative(path.dirname(foundProductFile), filePath).replace(/\\/g, '/');
+                 const filename = path.basename(filePath);
+                 
+                 // Regex to escape special chars in relPath
+                 const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                 
+                 // Try exact path first (handling potential trailing space in usage)
+                 // Match: load('...path...')
+                 const relPathPattern = new RegExp(`load\\s*\\(\\s*(['"])((?:(?!\\1)[^\\\\]|\\\\.)*?${escapeRegExp(relPath)}.*?)\\1\\s*\\)`);
+                 const exactMatch = text.match(relPathPattern);
+                 
+                 let index = -1;
+                 
+                 if (exactMatch) {
+                     index = exactMatch.index;
+                 } else {
+                      // Fallback: try just filename match in a load call
+                      const filenamePattern = new RegExp(`load\\s*\\(\\s*(['"])((?:(?!\\1)[^\\\\]|\\\\.)*?${escapeRegExp(filename)}.*?)\\1\\s*\\)`);
+                      const fileMatch = text.match(filenamePattern);
+                      if (fileMatch) {
+                          index = fileMatch.index;
+                      }
+                 }
+
+                 if (index !== -1) {
+                     const editor = await vscode.window.showTextDocument(doc);
+                     const pos = doc.positionAt(index);
+                     editor.selection = new vscode.Selection(pos, pos);
+                     editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+                     return;
+                 }
+             }
+         }
+
+
+        const dir = path.dirname(filePath);
         const basement = path.basename(filePath, ext);
         let targetPath = null;
         const isSourceJs = (ext === '.js');
@@ -439,7 +871,11 @@ function activate(context) {
         }
 
         if (!targetPath) {
-            vscode.window.showInformationMessage('No matching pair file found.');
+            // Keep silent if we are in HTML and didn't find anything, don't show "No matching pair" for HTML source unless we want to.
+            // But if we are here, we fell through HTML logic.
+            if (ext !== '.html') {
+                 vscode.window.showInformationMessage('No matching pair file found.');
+            }
             return;
         }
 
@@ -457,62 +893,47 @@ function activate(context) {
         const parsedSourceLines = parseLines(sourceLines);
         const sourceStack = getContextStack(parsedSourceLines, line - 1, new Map());
         
-        // --- Special Handling for 'cy' or 'linkedProduct' in source ---
-        // If we are on 'cy' (JSON) or 'linkedProduct' (JS), try to find deeper context in the line value
-        if (sourceStack.length > 0) {
-            const last = sourceStack[sourceStack.length - 1];
-            // Handle 'cy' (stringified JSON)
-            if (last.key === 'cy' || (last.aliases && last.aliases.includes('cy'))) {
-                const lineText = sourceLines[line - 1];
-                const vMatch = lineText.match(/:\s*(?:["']?)/);
-                if (vMatch && vMatch.index) {
-                    const valStart = vMatch.index + vMatch[0].length;
-                    const cursorRel = col - 1 - valStart;
-                    if (cursorRel > 0) {
-                        const valStr = lineText.substring(valStart);
-                        // Search for \"key\": pattern
-                        const keyRegex = /\\"(\w+)\\"\s*:/g;
-                        let match;
-                        let bestSubKey = null;
-                        while ((match = keyRegex.exec(valStr)) !== null) {
-                            if (match.index < cursorRel) {
-                                bestSubKey = match[1];
-                            } else {
-                                break;
-                            }
-                        }
-                        if (bestSubKey) {
-                            sourceStack.push({ type: 'prop', key: bestSubKey });
-                        }
-                    }
-                }
-            } 
-            // Handle 'linkedProduct' (JS object on one line)
-            else if (last.key === 'linkedProduct' || (last.aliases && last.aliases.includes('linkedProduct'))) {
-                 const lineText = sourceLines[line - 1];
-                 const vMatch = lineText.match(/:\s*/);
-                 if (vMatch && vMatch.index) {
-                     const valStart = vMatch.index + vMatch[0].length;
-                     const cursorRel = col - 1 - valStart;
-                     if (cursorRel > 0) {
-                         const valStr = lineText.substring(valStart);
-                         // JSON-like JS object keys: id:, "id":, 'id':
-                         const keyRegex = /(?:["']?(\w+)["']?)\s*:/g;
-                         let match;
-                         let bestSubKey = null;
-                         while ((match = keyRegex.exec(valStr)) !== null) {
-                             if (match.index < cursorRel) {
-                                 bestSubKey = match[1];
-                             } else {
-                                 break;
-                             }
-                         }
-                         if (bestSubKey) {
-                             sourceStack.push({ type: 'prop', key: bestSubKey });
-                         }
-                     }
+        // --- Generic Sub-property Handling ---
+        // If we represent a complex object on one line (like inside attributes array),
+        // getContextStack might just see the first key. We want the specific key under cursor.
+        const subProp = extractSubPropertyFromString(currentLineText, col - 1);
+        if (subProp) {
+            // subProp found! We are likely in a one-line object like { id:..., name:..., value:... }
+            // 1. Identify "identities" from this line (id, sku, name) to help matching target
+            const lineIdentities = {};
+            const idMatch = currentLineText.match(/id\s*:\s*(\d+)/);
+            if (idMatch) lineIdentities['id'] = idMatch[1];
+            
+            const nameMatch = currentLineText.match(/name\s*:\s*(["'])(.*?)\1/);
+            if (nameMatch) lineIdentities['name'] = nameMatch[2];
+
+            // 2. Fix the stack
+            // Current stack might be [...parent, prop: 'id'] or similar.
+            // We want [...parent, scope: '~item', prop: subProp.key]
+            
+            // Pop the last item if it looks like a false leaf (e.g. 'id' detected by simplistic parser)
+            if (sourceStack.length > 0) {
+                 const last = sourceStack[sourceStack.length - 1];
+                 // If the last item is a Prop that exists on this line, we replace it with ~item + subProp
+                 if (last.type === 'prop' && currentLineText.includes(last.key)) {
+                     sourceStack.pop();
                  }
             }
+            
+            // Add Scope (~item) with identities
+            sourceStack.push({
+                type: 'scope',
+                key: '~item',
+                identities: lineIdentities
+            });
+            
+            // Add the actual property we are on
+            sourceStack.push({
+                type: 'prop',
+                key: subProp.key,
+                valStartCol: subProp.valStartCol,
+                valOffset: subProp.valOffset
+            });
         }
 
         const normalizedStack = normalizeStack(sourceStack);
@@ -674,7 +1095,7 @@ function activate(context) {
             let searchText = null;
             
             // Try to extract string under cursor
-            const wordRange = document.getWordRangeAtPosition(selection, /["']([^"']+)["']/);
+            const wordRange = document.getWordRangeAtPosition(selection, /(["'])((?:(?!\1)[^\\]|\\.)*?)\1/);
             if (wordRange) {
                 const text = document.getText(wordRange);
                 // Strip quotes

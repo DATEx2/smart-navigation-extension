@@ -3,7 +3,7 @@
   "publisher": "DATEx2",
   "displayName": "DATEx2 Smart Navigation",
   "icon": "assets/icon.webp",
-  "version": "0.1.0",
+  "version": "0.1.22",
   "repository": {
     "type": "git",
     "url": "https://github.com/DATEx2/smart-navigation-extension"
@@ -16,6 +16,7 @@
   ],
   "activationEvents": [
     "onLanguage:json",
+    "workspaceContains:website/db/api/products",
     "onCommand:datex2.toggleProductFile",
     "onCommand:datex2.toggleTranslationFile"
   ],
@@ -36,7 +37,7 @@
         "command": "datex2.toggleProductFile",
         "key": "f12",
         "mac": "f12",
-        "when": "editorTextFocus && resourceFilename =~ /.*(js|json)/ && resourcePath =~ /products/"
+        "when": "editorTextFocus && resourceFilename =~ /.*(js|json|html)/ && resourcePath =~ /products/"
       },
       {
         "command": "datex2.toggleTranslationFile",
@@ -46,5 +47,10 @@
       }
     ]
   },
-  "scripts": {}
+  "scripts": {
+    "package": "vsce package -o smart-navigation-extension.vsix",
+    "build": "npm version patch --no-git-tag-version && npm run package",
+    "update-package": "npm version patch --no-git-tag-version && npm run package && antigravity --install-extension smart-navigation-extension.vsix --force",
+    "api": "npm run --prefix ../.. api --"
+  }
 }
