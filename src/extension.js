@@ -288,7 +288,6 @@ function activate(context) {
     updateStatusBar();
     
     // Watch for saves
-    }));
 
     // --- Cache Ref Update Logic ---
     // --- TOKENIZER & PARSER HELPERS ---
@@ -771,22 +770,30 @@ function activate(context) {
             // Unified Regex to support:
             // product://SKU@Line:Col/path#html
             
-            // Regex using backreference to match closing quote exactly
-            const customRegex = /(["'])(product|category|profile):\/\/([^@]*)@([^/]+)\/([^#]+?)(?:#(.+?))?\1/g;
-            
-            // Temporary check to see if it runs
-            // vscode.window.showInformationMessage('DATEx2 Link Provider Running');
+            // Regex for new format
+            const customRegex = /([\"'])(?:(product):([^@]+)@|(profile|category)@)([^\/]+)\/([^#\"']+?)(?:#([^\"']+))?\1/g;
             
             let customMatch;
             while ((customMatch = customRegex.exec(text))) {
                 const fullMatchStr = customMatch[0];
-                const quote = customMatch[1]; 
-                const type = customMatch[2]; 
-                const hostPart = customMatch[3]; 
-                const posPart = customMatch[4]; 
-                const jsonPath = customMatch[5];
-                const htmlPath = customMatch[6]; // Optional fragment 
-
+                let quote, type, hostPart, posPart, jsonPath, htmlPath;
+                
+                quote = customMatch[1];
+                if (customMatch[2] === 'product') {
+                    // product:SLUG@... format
+                    type = customMatch[2];
+                    hostPart = customMatch[3];
+                    posPart = customMatch[5];
+                    jsonPath = customMatch[6];
+                    htmlPath = customMatch[7];
+                } else {
+                    // profile@ or category@ format
+                    type = customMatch[4];
+                    hostPart = '';
+                    posPart = customMatch[5];
+                    jsonPath = customMatch[6];
+                    htmlPath = customMatch[7];
+                }
                 // Debug matching
                 outputChannel.appendLine(`[DATEx2] Match: ${fullMatchStr}`);
                 outputChannel.appendLine(`[DATEx2] Type: ${type}, Host: ${hostPart}, Pos: ${posPart}, Path: ${jsonPath}`);
@@ -801,16 +808,18 @@ function activate(context) {
                 if (posParts.length > 1) targetCol = parseInt(posParts[1]);
 
                 if (type === 'profile') {
-                    targetPath = 'db/profile.json';
+                    // profile@LINE:COL/path - opens db/profile/profile.js at line/col
+                    targetPath = 'db/profile/profile.js';
                     if (htmlPath) {
-                         targetPath = `db/${htmlPath}`;
+                         targetPath = `db/profile/${htmlPath}`;
                          targetLine = 1; 
                          targetCol = 1;
                     }
                 } else if (type === 'category') {
-                    targetPath = 'db/categories.json';
+                    // category@LINE:COL/path - opens db/categories/categories.js at line/col
+                    targetPath = 'db/categories/categories.js';
                     if (htmlPath) {
-                        targetPath = `db/${htmlPath}`;
+                        targetPath = `db/categories/${htmlPath}`;
                         targetLine = 1;
                         targetCol = 1;
                     }
@@ -852,7 +861,7 @@ function activate(context) {
         }
     };
 
-    context.subscriptions.push(vscode.languages.registerDocumentLinkProvider('json', provider));
+    context.subscriptions.push(vscode.languages.registerDocumentLinkProvider(['json', 'javascript', 'html'], provider));
 
     // Terminal Link Provider
     context.subscriptions.push(vscode.window.registerTerminalLinkProvider({
@@ -1689,33 +1698,37 @@ function activate(context) {
                 let refLine = 1;
                 let refCol = 1;
 
-                if (ref.includes('://')) {
-                    // URL Format: type://host@line:col/path#html
-                    const regex = /(product|category|profile):\/\/([^@]*)@([^/]+)\/([^#]+)(?:#.*)?/;
+                if (ref.includes('@')) {
+                    // New Format: product:host@line:col/path#html or profile@line:col/path
+                    const regex = /(product):([^@]+)@([^/]+)\/([^#]+)(?:#.*)?|(profile|category)@([^/]+)\/([^#]+)(?:#.*)?/;
                     const match = ref.match(regex);
                     if (match) {
-                        const type = match[1];
-                        const host = match[2];
-                        const pos = match[3];
+                        let type, host, pos;
+                        if (match[1] === 'product') {
+                            type = 'product';
+                            host = match[2];
+                            pos = match[3];
+                        } else {
+                            type = match[5];
+                            host = '';
+                            pos = match[6];
+                        }
                         
                         const posParts = pos.split(':');
                         if (posParts.length > 0) refLine = parseInt(posParts[0]);
                         if (posParts.length > 1) refCol = parseInt(posParts[1]);
                         
                         if (type === 'product') {
-                             targetSrcPath = path.join(rootDir, `website/tools/ecwid/db/products/${host}/${host}.js`);
-                             // Correction: rootDir usually ends in parent of website? 
-                             // Wait, logic above: path.join(rootDir, 'website/db/translations/...')
-                             // So rootDir is workspace root.
-                             // Correct path: tools/ecwid/db/products/...
-                             targetSrcPath = path.join(rootDir, `tools/ecwid/db/products/${host}/${host}.js`);
+                             targetSrcPath = path.join(rootDir, `db/products/${host}/${host}.js`);
                         } else if (type === 'category') {
-                             targetSrcPath = path.join(rootDir, 'tools/ecwid/db/categories.json');
+                             targetSrcPath = path.join(rootDir, 'db/categories/categories.js');
                         } else if (type === 'profile') {
-                             targetSrcPath = path.join(rootDir, 'tools/ecwid/db/profile.json');
+                             targetSrcPath = path.join(rootDir, 'db/profile/profile.js');
                         }
                     }
-                } else {
+                } else if (ref.includes('://')) {
+                    // URL Format (Legacy): type://host@line:col/path#html
+                    const regex = /(product|category|profile):\/\/([^@]*)@([^/]+)\/([^#]+)(?:#.*)?/;
                     // Legacy Format: path:line
                     const parts = ref.split(':');
                     const refPathRel = parts[0];
