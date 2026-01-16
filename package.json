@@ -3,7 +3,7 @@
   "publisher": "DATEx2",
   "displayName": "DATEx2 Smart Navigation",
   "icon": "assets/icon.webp",
-  "version": "0.1.59",
+  "version": "0.1.64",
   "repository": {
     "type": "git",
     "url": "https://github.com/DATEx2/smart-navigation-extension"
@@ -16,7 +16,9 @@
   ],
   "activationEvents": [
     "onLanguage:json",
-    "workspaceContains:tools/ecwid/db/products",
+    "onLanguage:javascript",
+    "onLanguage:html",
+    "workspaceContains:db/products",
     "onCommand:datex2.toggleProductFile",
     "onCommand:datex2.toggleTranslationFile"
   ],

@@ -61,7 +61,7 @@ function activate(context) {
     }
 
     async function updateStatusBar() {
-        const productFiles = await vscode.workspace.findFiles('tools/ecwid/db/products/**/*.js', '**/node_modules/**');
+        const productFiles = await vscode.workspace.findFiles('db/products/**/*.js', '**/node_modules/**');
         let total = 0;
         let missing = 0;
         let cacheMissing = 0;
@@ -98,7 +98,7 @@ function activate(context) {
                 ? vscode.workspace.workspaceFolders[0].uri.fsPath
                 : '';
             if (rootPath) {
-                const cachePath = path.join(rootPath, 'website/db/translations/translations.ai.cache.json');
+                const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
                 if (fs.existsSync(cachePath)) {
                     const cacheContent = fs.readFileSync(cachePath, 'utf8');
                     const cacheJson = JSON.parse(cacheContent);
@@ -180,7 +180,7 @@ function activate(context) {
 
     context.subscriptions.push(vscode.commands.registerCommand('datex2.showMissingTranslations', async () => {
         // Find ALL product files, sort them
-        const productFiles = (await vscode.workspace.findFiles('tools/ecwid/db/products/**/*.js', '**/node_modules/**'))
+        const productFiles = (await vscode.workspace.findFiles('db/products/**/*.js', '**/node_modules/**'))
             .sort((a, b) => a.fsPath.localeCompare(b.fsPath));
         
         // Append cache file if exists
@@ -188,7 +188,7 @@ function activate(context) {
             ? vscode.workspace.workspaceFolders[0].uri.fsPath
             : null;
         if (rootPath) {
-            const cachePath = path.join(rootPath, 'website/db/translations/translations.ai.cache.json');
+            const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
             if (fs.existsSync(cachePath)) {
                 productFiles.push(vscode.Uri.file(cachePath));
             }
@@ -288,15 +288,214 @@ function activate(context) {
     updateStatusBar();
     
     // Watch for saves
+    }));
+
+    // --- Cache Ref Update Logic ---
+    // --- TOKENIZER & PARSER HELPERS ---
+    function tokenize(text) {
+        const tokens = [];
+        const regex = /(\/\/.*)|(\/\*[\s\S]*?\*\/)|([{}\[\]:,])|('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")|([a-zA-Z_$][\w$]*)|(\(|\))/g;
+        
+        let match;
+        let line = 1;
+        let col = 1;
+        let lastIndex = 0;
+    
+        const advance = (idx) => {
+            while (lastIndex < idx) {
+                if (text[lastIndex] === '\n') {
+                    line++;
+                    col = 1;
+                } else {
+                    col++;
+                }
+                lastIndex++;
+            }
+        };
+    
+        while ((match = regex.exec(text)) !== null) {
+            advance(match.index);
+            const type = match[1] || match[2] ? 'Comment' : match[3] ? 'Punct' : match[4] ? 'String' : match[5] ? 'Ident' : match[6] ? 'Paren' : 'Unknown';
+            const val = match[0];
+            let tempL = line;
+            let tempC = col;
+            for (let char of val) {
+                if (char === '\n') { tempL++; tempC = 1; }
+                else tempC++;
+            }
+            if (type !== 'Comment') tokens.push({ type, val, line, col });
+            line = tempL; col = tempC; lastIndex += val.length;
+        }
+        return tokens;
+    }
+
+    function parse(tokens) {
+        let current = 0;
+        function walk() {
+            if (current >= tokens.length) return null;
+            let token = tokens[current];
+            
+            if (token.val === '{') {
+                current++;
+                const node = { type: 'Object', properties: [], start: token };
+                while (current < tokens.length && tokens[current].val !== '}') {
+                    const prop = walkProperty();
+                    if (prop) node.properties.push(prop);
+                    if (tokens[current] && tokens[current].val === ',') current++;
+                }
+                current++; return node;
+            }
+            if (token.val === '[') {
+                current++;
+                const node = { type: 'Array', elements: [], start: token };
+                while (current < tokens.length && tokens[current].val !== ']') {
+                    const elem = walk();
+                    if (elem) node.elements.push(elem);
+                    if (tokens[current] && tokens[current].val === ',') current++;
+                }
+                current++; return node;
+            }
+            if (token.type === 'Ident' && token.val === 'load') {
+                current++;
+                if (tokens[current] && tokens[current].val === '(') {
+                    current++; const arg = walk(); current++; // skip )
+                    return { type: 'Call', callee: 'load', arguments: [arg], start: token };
+                }
+            }
+            if (token.type === 'String' || token.type === 'Ident') { // Ident can be value
+                current++;
+                return { type: 'Literal', val: token.val, raw: token.val, start: token };
+            }
+            // Avoid consuming closing delimiters if we are lost
+            if (token.val === '}' || token.val === ']' || token.val === ')' || token.val === ',') {
+                return null;
+            }
+            current++;
+            return null;
+        }
+        function walkProperty() {
+            if (current >= tokens.length) return null;
+            if (tokens[current].val === '}') return null;
+            let keyToken = tokens[current];
+            if (current + 1 < tokens.length && tokens[current+1].val === ':') {
+                current++; current++;
+                const value = walk();
+                return { type: 'Property', key: keyToken.val.replace(/['"]/g, ''), value: value, start: keyToken };
+            }
+            return null;
+        }
+        while(current < tokens.length && tokens[current].val !== '{') current++;
+        if (current < tokens.length) return walk();
+        return null;
+    }
+
+    function traverseAndCollect(node, pathStack, results, resolveName) {
+        if (!node) return;
+        if (node.type === 'Object') {
+            let name = null;
+            if (resolveName) {
+                const nameProp = node.properties.find(p => p.key === 'name');
+                const textProp = node.properties.find(p => p.key === 'text');
+                if (nameProp && nameProp.value.type === 'Literal') name = nameProp.value.val.replace(/['"]/g, '').trim();
+                else if (textProp && textProp.value.type === 'Literal') name = textProp.value.val.replace(/['"]/g, '').trim();
+            }
+            let myPathStack = [...pathStack];
+            if (name && resolveName) { myPathStack.pop(); myPathStack.push(name); }
+            node.properties.forEach(prop => traverseAndCollect(prop, myPathStack, results, false));
+        } else if (node.type === 'Array') {
+            node.elements.forEach((elem, index) => traverseAndCollect(elem, [...pathStack, index.toString()], results, true));
+        } else if (node.type === 'Property') {
+            traverseAndCollect(node.value, [...pathStack, node.key], results, false);
+        } else if (node.type === 'Literal') {
+            const str = node.val;
+            if (str.startsWith("'") || str.startsWith('"')) {
+                const content = str.substring(1, str.length - 1);
+                if (content.endsWith(' ') || content === ' ') {
+                    results.push({ key: content, line: node.start.line, col: node.start.col, path: pathStack.join('/') });
+                }
+            }
+        } else if (node.type === 'Call' && node.callee === 'load') {
+            const arg = node.arguments[0];
+            if (arg && arg.type === 'Literal') {
+                const quotedPath = arg.val;
+                const relPath = quotedPath.substring(1, quotedPath.length - 1);
+                results.push({ isLoad: true, htmlPath: relPath, line: node.start.line, col: node.start.col, path: pathStack.join('/') });
+            }
+        }
+    }
+
+    // --- Cache Ref Update Logic (Advanced) ---
+    async function updateCacheRefs(doc) {
+        if (!doc.fileName.endsWith('.js') || !doc.fileName.includes(path.sep + 'products' + path.sep)) return;
+        try {
+            const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0 ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
+            if (!rootPath) return;
+            const slug = path.basename(path.dirname(doc.fileName));
+            if (slug !== path.basename(doc.fileName, '.js')) return;
+
+            const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+            if (!fs.existsSync(cachePath)) return;
+
+            // Read & Cleanup Cache
+            let cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+            let cacheModified = false;
+            const refPrefix = `product://${slug}@`;
+            Object.keys(cache).forEach(k => {
+                if (cache[k].refs) {
+                    const originalLength = cache[k].refs.length;
+                    cache[k].refs = cache[k].refs.filter(r => !r.startsWith(refPrefix));
+                    if (cache[k].refs.length !== originalLength) cacheModified = true;
+                }
+            });
+
+            // Parse File
+            const content = doc.getText();
+            const tokens = tokenize(content);
+            const ast = parse(tokens);
+            const results = [];
+            traverseAndCollect(ast, [], results, false);
+
+            results.forEach(res => {
+                let cacheKey = res.key;
+                let htmlPath = null;
+                if (res.isLoad) {
+                     const htmlPathAbs = path.join(path.dirname(doc.fileName), res.htmlPath.trim());
+                     if (fs.existsSync(htmlPathAbs)) {
+                         cacheKey = fs.readFileSync(htmlPathAbs, 'utf8');
+                         htmlPath = res.htmlPath.trim();
+                     } else cacheKey = null;
+                }
+                
+                if (cacheKey && cache[cacheKey]) {
+                    const suffix = htmlPath ? `#${htmlPath}` : '';
+                    const newRef = `product://${slug}@${res.line}:${res.col}/${res.path}${suffix}`;
+                    if (!cache[cacheKey].refs) cache[cacheKey].refs = [];
+                    if (!cache[cacheKey].refs.includes(newRef)) {
+                        cache[cacheKey].refs.push(newRef);
+                        cache[cacheKey].refs.sort();
+                        cacheModified = true;
+                    }
+                }
+            });
+
+            if (cacheModified) {
+               fs.writeFileSync(cachePath, JSON.stringify(cache, null, 4));
+            }
+        } catch (e) {
+            console.error('Error updating cache refs:', e);
+        }
+    }
+
     context.subscriptions.push(vscode.workspace.onDidSaveTextDocument((doc) => {
         if (doc.fileName.endsWith('.js') && doc.fileName.includes('products')) {
             updateStatusBar();
+            updateCacheRefs(doc);
         }
     }));
 
     // Watch for HTML saves to invalidate JS load() and update cache
     context.subscriptions.push(vscode.workspace.onDidSaveTextDocument((doc) => {
-        // Only react to HTML files inside 'tools/ecwid/db/products' (implied by checking for product JS context)
+        // Only react to HTML files inside 'db/products' (implied by checking for product JS context)
         if (doc.languageId === 'html') {
             try {
                 const newText = doc.getText();
@@ -338,8 +537,8 @@ function activate(context) {
 
                 if (!jsFile) return; // Not a product HTML file we recognize
 
-                const cachePath = path.join(rootPath, 'website/db/translations/translations.ai.cache.json');
-                const orphanPath = path.join(rootPath, 'website/db/translations/translations.orphans.json');
+                const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+                const orphanPath = path.join(rootPath, 'db/translations/translations.orphans.json');
                 
                 let cache = {};
                 if (fs.existsSync(cachePath)) {
@@ -484,7 +683,7 @@ function activate(context) {
     }));
 
     // Watch for translation cache changes
-    const cacheWatcher = vscode.workspace.createFileSystemWatcher('**/website/db/translations/translations.ai.cache.json');
+    const cacheWatcher = vscode.workspace.createFileSystemWatcher('**/db/translations/translations.ai.cache.json');
     cacheWatcher.onDidChange(updateStatusBar);
     cacheWatcher.onDidCreate(updateStatusBar);
     cacheWatcher.onDidDelete(updateStatusBar);
@@ -602,16 +801,16 @@ function activate(context) {
                 if (posParts.length > 1) targetCol = parseInt(posParts[1]);
 
                 if (type === 'profile') {
-                    targetPath = 'tools/ecwid/db/profile.json';
+                    targetPath = 'db/profile.json';
                     if (htmlPath) {
-                         targetPath = `tools/ecwid/db/${htmlPath}`;
+                         targetPath = `db/${htmlPath}`;
                          targetLine = 1; 
                          targetCol = 1;
                     }
                 } else if (type === 'category') {
-                    targetPath = 'tools/ecwid/db/categories.json';
+                    targetPath = 'db/categories.json';
                     if (htmlPath) {
-                        targetPath = `tools/ecwid/db/${htmlPath}`;
+                        targetPath = `db/${htmlPath}`;
                         targetLine = 1;
                         targetCol = 1;
                     }
@@ -619,11 +818,11 @@ function activate(context) {
                     const codeOrSlug = hostPart;
                     if (codeOrSlug) {
                         if (htmlPath) {
-                             targetPath = `tools/ecwid/db/products/${codeOrSlug}/${htmlPath}`;
+                             targetPath = `db/products/${codeOrSlug}/${htmlPath}`;
                              targetLine = 1; 
                              targetCol = 1;
                         } else {
-                            targetPath = `tools/ecwid/db/products/${codeOrSlug}/${codeOrSlug}.js`;
+                            targetPath = `db/products/${codeOrSlug}/${codeOrSlug}.js`;
                         }
                     }
                 }
