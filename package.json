@@ -3,7 +3,7 @@
   "publisher": "DATEx2",
   "displayName": "DATEx2 Smart Navigation",
   "icon": "assets/icon.webp",
-  "version": "0.1.26",
+  "version": "0.1.59",
   "repository": {
     "type": "git",
     "url": "https://github.com/DATEx2/smart-navigation-extension"
@@ -50,7 +50,7 @@
   "scripts": {
     "package": "vsce package -o smart-navigation-extension.vsix",
     "build": "npm version patch --no-git-tag-version && npm run package",
-    "update-package": "npm version patch --no-git-tag-version && npm run package && antigravity --install-extension smart-navigation-extension.vsix --force",
+    "update-package": "npm version patch --no-git-tag-version && npm run package && antigravity --install-extension smart-navigation-extension.vsix --force && node -e \"console.log('Extension \\x1b[33m' + require('./package.json').version + '\\x1b[0m \\'\\x1b[33msmart-navigation-extension.vsix\\x1b[0m\\' was successfully installed.')\"",
     "api": "npm run --prefix ../.. api --"
   }
 }
