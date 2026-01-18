@@ -857,11 +857,116 @@ function activate(context) {
                      }
                 }
             }
+
+            // --- Data URI Support (Ctrl+Click) ---
+            // Support: quoted "data:..." or 'data:...' AND unquoted inside url(data:...)
+            const dataUriRegex = /(["'])(data:[^"'\s]*)\1|url\((data:[^)"'\s]*)\)/g;
+            let dataMatch;
+            while ((dataMatch = dataUriRegex.exec(text))) {
+                 const isUnquoted = !!dataMatch[3];
+                 const fullUri = isUnquoted ? dataMatch[3] : dataMatch[2];
+                 
+                 let start, end;
+                 if (isUnquoted) {
+                     start = dataMatch.index + 4; // url(
+                     end = start + fullUri.length;
+                 } else {
+                     start = dataMatch.index + 1; // " or '
+                     end = start + fullUri.length;
+                 }
+
+                 const range = new vscode.Range(document.positionAt(start), document.positionAt(end));
+                 
+                 const args = [fullUri];
+                 const commandUri = vscode.Uri.parse(`command:datex2.openDataUri?${encodeURIComponent(JSON.stringify(args))}`);
+                 
+                 const link = new vscode.DocumentLink(range, commandUri);
+                 link.tooltip = "Open Data URI in Browser";
+                 links.push(link);
+            }
+
             return links;
         }
     };
 
-    context.subscriptions.push(vscode.languages.registerDocumentLinkProvider(['json', 'javascript', 'html'], provider));
+    // Command to open Data URI
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.openDataUri', async (uriString) => {
+        try {
+            // Create a temporary HTML file to display the image
+            // This avoids issues with OS command length limits or protocol handling for data: URIs
+            const tmpDir = require('os').tmpdir();
+            const tmpFile = path.join(tmpDir, 'datex2_image_preview.html');
+            
+            const htmlContent = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Image Preview</title>
+                    <style>
+                        body { 
+                            background-color: #1e1e1e; 
+                            display: flex; 
+                            justify-content: center; 
+                            align-items: center; 
+                            height: 100vh; 
+                            margin: 0; 
+                        }
+                        img { 
+                            max-width: 90%; 
+                            max-height: 90%; 
+                            box-shadow: 0 0 20px rgba(0,0,0,0.5); 
+                        }
+                    </style>
+                </head>
+                <body>
+                    <img src="${uriString}" />
+                </body>
+                </html>
+            `;
+            
+            fs.writeFileSync(tmpFile, htmlContent, 'utf8');
+            await vscode.env.openExternal(vscode.Uri.file(tmpFile));
+            
+        } catch (e) {
+            vscode.window.showErrorMessage('Failed to open data URI: ' + e.message);
+        }
+    }));
+
+    // --- Image Preview Hover ---
+    context.subscriptions.push(vscode.languages.registerHoverProvider(['json', 'javascript', 'html', 'css', 'scss', 'less'], {
+        provideHover(document, position, token) {
+            const line = document.lineAt(position.line);
+            const text = line.text;
+            // Regex for quoted OR url(...) unquoted
+            const dataUriRegex = /(["'])(data:image\/[^"'\s]*)\1|url\((data:image\/[^)"'\s]*)\)/g;
+            let match;
+            while ((match = dataUriRegex.exec(text))) {
+                const isUnquoted = !!match[3];
+                const dataUri = isUnquoted ? match[3] : match[2];
+                
+                let startOfData, endOfData;
+                if (isUnquoted) {
+                     startOfData = match.index + 4;
+                     endOfData = startOfData + dataUri.length;
+                } else {
+                     startOfData = match.index + 1;
+                     endOfData = startOfData + dataUri.length;
+                }
+
+                if (position.character >= startOfData && position.character <= endOfData) {
+                    const md = new vscode.MarkdownString();
+                    md.supportHtml = true;
+                    md.isTrusted = true;
+                    md.appendMarkdown(`![Image Preview](${dataUri})`);
+                    return new vscode.Hover(md);
+                }
+            }
+            return null;
+        }
+    }));
+
+    // Register Link Provider with CSS support
+    context.subscriptions.push(vscode.languages.registerDocumentLinkProvider(['json', 'javascript', 'html', 'css', 'scss', 'less'], provider));
 
     // Terminal Link Provider
     context.subscriptions.push(vscode.window.registerTerminalLinkProvider({
