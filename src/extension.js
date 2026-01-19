@@ -691,7 +691,7 @@ function activate(context) {
     // --- End Translation Status Bar Logic ---
     const provider = {
         provideDocumentLinks(document, token) {
-            outputChannel.appendLine(`[${new Date().toISOString()}] ProvideDocumentLinks called for: ${document.fileName}`);
+            // outputChannel.appendLine(`[${new Date().toISOString()}] ProvideDocumentLinks called for: ${document.fileName}`);
             const text = document.getText();
             // Regex to match file://${var}/path...
             const regex = /(file:\/\/\$\{([^}]+)\}([^"'\s]*))/g;
@@ -703,13 +703,13 @@ function activate(context) {
                 const varName = match[2];   // var
                 const remainder = match[3]; // /path/to/file:Line#...
 
-                outputChannel.appendLine(`Found match: ${fullMatch}`);
+                // outputChannel.appendLine(`Found match: ${fullMatch}`);
 
                 // Get variable value from configuration
                 const config = vscode.workspace.getConfiguration();
                 const varValue = config.get(varName);
 
-                outputChannel.appendLine(`Variable '${varName}' resolved to: '${varValue}'`);
+                // outputChannel.appendLine(`Variable '${varName}' resolved to: '${varValue}'`);
 
                 if (varValue && typeof varValue === 'string') {
                     // Start index of the match
@@ -743,7 +743,7 @@ function activate(context) {
                         combined = '/' + combined;
                     }
 
-                    outputChannel.appendLine(`Constructed path: ${combined}`);
+                    // outputChannel.appendLine(`Constructed path: ${combined}`);
                     
                     let targetUri = vscode.Uri.file(combined);
                     
@@ -752,19 +752,19 @@ function activate(context) {
                         targetUri = targetUri.with({ fragment: `L${line}` });
                     }
                     
-                    outputChannel.appendLine(`Final Target URI: ${targetUri.toString()}`);
+                    // outputChannel.appendLine(`Final Target URI: ${targetUri.toString()}`);
 
                     const range = new vscode.Range(startPos, endPos);
                     const link = new vscode.DocumentLink(range, targetUri);
                     link.tooltip = `Open ${combined}`;
                     links.push(link);
                 } else {
-                    outputChannel.appendLine(`WARNING: Could not resolve variable '${varName}'`);
+                    // outputChannel.appendLine(`WARNING: Could not resolve variable '${varName}'`);
                 }
             }
-            outputChannel.appendLine(`Found ${links.length} links.`);
+            // outputChannel.appendLine(`Found ${links.length} links.`);
 
-            outputChannel.appendLine(`[DATEx2] Scanning ${document.fileName} for custom links...`);
+            // outputChannel.appendLine(`[DATEx2] Scanning ${document.fileName} for custom links...`);
             
             // --- Custom DATEx2 Link Logic ---
             // Unified Regex to support:
@@ -795,8 +795,8 @@ function activate(context) {
                     htmlPath = customMatch[7];
                 }
                 // Debug matching
-                outputChannel.appendLine(`[DATEx2] Match: ${fullMatchStr}`);
-                outputChannel.appendLine(`[DATEx2] Type: ${type}, Host: ${hostPart}, Pos: ${posPart}, Path: ${jsonPath}`);
+                // outputChannel.appendLine(`[DATEx2] Match: ${fullMatchStr}`);
+                // outputChannel.appendLine(`[DATEx2] Type: ${type}, Host: ${hostPart}, Pos: ${posPart}, Path: ${jsonPath}`);
 
                 let targetPath = '';
                 let targetLine = 1;
@@ -1924,6 +1924,54 @@ function activate(context) {
             }
         }
     }));
+
+    // --- Cursor Preservation for External Reloads ---
+    const lastSelections = new Map(); // fileName (lowercase) -> Position
+
+    context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(e => {
+        if (e.selections.length > 0 && e.textEditor.document.fileName.includes('products') && e.textEditor.document.fileName.endsWith('.js')) {
+            lastSelections.set(e.textEditor.document.fileName.toLowerCase(), e.selections[0].active);
+        }
+    }));
+
+    // context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => {
+    //     const doc = e.document;
+    //     // Only target product JS files
+    //     if (!doc.fileName.includes('products') || !doc.fileName.endsWith('.js')) return;
+        
+    //     // Find visible editor for this document
+    //     const editor = vscode.window.visibleTextEditors.find(ed => ed.document === doc);
+    //     if (!editor) return;
+
+    //     // Heuristic: If contentChanges involve the entire file (start 0,0 to end), 
+    //     // OR simply if we know these files are auto-generated, we trust the last known selection.
+    //     // However, user might be typing.
+        
+    //     // Check if change is "Large" or "Whole File"
+    //     // But simpler: If the change caused the cursor to jump to 0,0 (which happens on FS refresh usually), restore it.
+    //     // We use a slightly longer timeout and multiple checks.
+        
+    //     setTimeout(() => {
+    //          const key = doc.fileName.toLowerCase();
+    //          const lastPos = lastSelections.get(key);
+             
+    //          // Blindly restore if we have a history, because we trust that
+    //          // if the file was reloaded by our tools, the user wants to stay where they were.
+    //          if (lastPos) {
+    //              // Verify validity of position (in case file shrank)
+    //              let newLine = lastPos.line;
+    //              if (newLine >= doc.lineCount) newLine = doc.lineCount - 1;
+    //              if (newLine < 0) newLine = 0;
+                 
+    //              const newPos = new vscode.Position(newLine, lastPos.character);
+                 
+    //              // Only verify if we are significantly far from target?
+    //              // Or just force it. Force is better for stability.
+    //              editor.selection = new vscode.Selection(newPos, newPos);
+    //              editor.revealRange(new vscode.Range(newPos, newPos), vscode.TextEditorRevealType.InCenter);
+    //          }
+    //     }, 150); // Increased delay
+    // }));
 
 } // End of activate
 
