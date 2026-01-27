@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
+const cp = require('child_process');
 
 const outputChannel = vscode.window.createOutputChannel("Path Expander Debug");
 
@@ -1972,6 +1973,50 @@ function activate(context) {
     //          }
     //     }, 150); // Increased delay
     // }));
+
+
+    // --- Image Preview & Open Logic for Thumbnails ---
+    const THUMBS_DIR = 'd:\\DATEx2.bike\\GitHub\\bikeRAW\\Thumbnails\\';
+
+    const ImageThumbnailProvider = {
+        provideHover(document, position, token) {
+            const range = document.getWordRangeAtPosition(position, /["']([^"']+\.(webp|png|jpg|jpeg))["']/);
+            if (!range) return;
+
+            const text = document.getText(range);
+            // remove quotes
+            const fileName = text.substring(1, text.length - 1);
+            
+            const filePath = path.join(THUMBS_DIR, fileName);
+            if (fs.existsSync(filePath)) {
+                // Return image preview
+                const markdown = new vscode.MarkdownString(`### ${fileName}\n\n![${fileName}](${vscode.Uri.file(filePath).toString()})`);
+                markdown.baseUri = vscode.Uri.file(THUMBS_DIR);
+                markdown.supportHtml = true;
+                return new vscode.Hover(markdown, range);
+            }
+        },
+
+        provideDefinition(document, position, token) {
+            const range = document.getWordRangeAtPosition(position, /["']([^"']+\.(webp|png|jpg|jpeg))["']/);
+            if (!range) return;
+            
+            const text = document.getText(range);
+            const fileName = text.substring(1, text.length - 1);
+            
+            const filePath = path.join(THUMBS_DIR, fileName);
+            if (fs.existsSync(filePath)) {
+                // Open external
+                // Windows specific
+                cp.exec(`start "" "${filePath}"`);
+                // Return null to stop VS Code from doing anything else
+                return null;
+            }
+        }
+    };
+
+    context.subscriptions.push(vscode.languages.registerHoverProvider(['javascript', 'json'], ImageThumbnailProvider));
+    context.subscriptions.push(vscode.languages.registerDefinitionProvider(['javascript', 'json'], ImageThumbnailProvider));
 
 } // End of activate
 
