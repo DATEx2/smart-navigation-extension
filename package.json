@@ -3,7 +3,7 @@
   "publisher": "DATEx2",
   "displayName": "DATEx2 Smart Navigation",
   "icon": "assets/icon.webp",
-  "version": "0.1.77",
+  "version": "0.1.152",
   "repository": {
     "type": "git",
     "url": "https://github.com/DATEx2/smart-navigation-extension"
@@ -33,6 +33,26 @@
       {
         "command": "datex2.toggleTranslationFile",
         "title": "Toggle Translation File"
+      },
+      {
+        "command": "datex2.searchProductById",
+        "title": "Search Product By ID"
+      },
+      {
+        "command": "datex2.boldify",
+        "title": "Boldify"
+      },
+      {
+        "command": "datex2.unboldify",
+        "title": "Unboldify"
+      },
+      {
+        "command": "datex2.toggleBoldify",
+        "title": "Toggle Boldify"
+      },
+      {
+        "command": "datex2.showSeoPreview",
+        "title": "Show SEO Preview"
       }
     ],
     "keybindings": [
@@ -47,13 +67,85 @@
         "key": "ctrl+f12",
         "mac": "cmd+f12",
         "when": "editorTextFocus"
+      },
+      {
+        "command": "datex2.toggleBoldify",
+        "key": "f1",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "datex2.showSeoPreview",
+        "key": "ctrl+alt+f12",
+        "when": "editorTextFocus"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "DATEx2 Smart Navigation",
+      "properties": {
+        "datex2.hover.thumbs.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable image preview on hover for thumbnail paths (thumbs/...).",
+          "scope": "resource"
+        },
+        "datex2.hover.thumbs.maxWidth": {
+          "type": "number",
+          "default": 300,
+          "description": "Maximum width of the thumbnail preview image.",
+          "scope": "resource"
+        },
+        "datex2.hover.thumbs.maxHeight": {
+          "type": "number",
+          "default": 300,
+          "description": "Maximum height of the thumbnail preview image.",
+          "scope": "resource"
+        },
+        "datex2.hover.thumbs.showFileSize": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show file size (KB) in the thumbnail preview title.",
+          "scope": "resource"
+        },
+        "datex2.hover.dataUri.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable image preview on hover for Data URIs.",
+          "scope": "resource"
+        },
+        "datex2.hover.dataUri.maxWidth": {
+          "type": "number",
+          "default": 300,
+          "description": "Maximum width of the Data URI preview image.",
+          "scope": "resource"
+        },
+        "datex2.hover.dataUri.maxHeight": {
+          "type": "number",
+          "default": 300,
+          "description": "Maximum height of the Data URI preview image.",
+          "scope": "resource"
+        },
+        "datex2.hover.dataUri.showFileSize": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show approximate file size (KB) in the Data URI preview title.",
+          "scope": "resource"
+        },
+        "datex2.thumbsRegistryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the thumbs.json registry file.",
+          "scope": "resource"
+        }
+      }
+    }
   },
   "scripts": {
     "package": "vsce package -o smart-navigation-extension.vsix",
     "build": "npm version patch --no-git-tag-version && npm run package",
     "update-package": "npm version patch --no-git-tag-version && npm run package && antigravity --install-extension smart-navigation-extension.vsix --force && node -e \"console.log('Extension \\x1b[33m' + require('./package.json').version + '\\x1b[0m \\'\\x1b[33msmart-navigation-extension.vsix\\x1b[0m\\' was successfully installed.')\"",
     "api": "npm run --prefix ../.. api --"
+  },
+  "dependencies": {
+    "image-size": "^2.0.2"
   }
 }

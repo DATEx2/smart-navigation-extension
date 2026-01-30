@@ -2,10 +2,15 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const cp = require('child_process');
+const imageSize = require('image-size');
+const seoPreview = require('./seoPreview');
+const os = require('os');
+const crypto = require('crypto');
 
 const outputChannel = vscode.window.createOutputChannel("Path Expander Debug");
 
 function activate(context) {
+    seoPreview.activate(context);
     // --- Translation Status Bar Logic ---
     const missingItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     const percentItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
@@ -285,6 +290,79 @@ function activate(context) {
         vscode.window.showInformationMessage('No missing translations found!');
     }));
 
+    // --- Boldify / Unboldify Logic (UTF-8 Mathematical Sans-Serif Bold) ---
+    function toBold(text) {
+        return Array.from(text).map(char => {
+            const cp = char.codePointAt(0);
+            if (cp >= 0x41 && cp <= 0x5A) return String.fromCodePoint(cp + 119743);
+            if (cp >= 0x61 && cp <= 0x7A) return String.fromCodePoint(cp + 119737);
+            if (cp >= 0x30 && cp <= 0x39) return String.fromCodePoint(cp + 120734);
+            return char;
+        }).join('');
+    }
+
+    function fromBold(text) {
+        return Array.from(text).map(char => {
+            const cp = char.codePointAt(0);
+            if (cp >= 0x1D400 && cp <= 0x1D419) return String.fromCodePoint(cp - 119743);
+            if (cp >= 0x1D41A && cp <= 0x1D433) return String.fromCodePoint(cp - 119737);
+            if (cp >= 0x1D7CE && cp <= 0x1D7D7) return String.fromCodePoint(cp - 120734);
+            return char;
+        }).join('');
+    }
+
+    function isBold(text) {
+        let hasBold = false;
+        for (const char of text) {
+            const cp = char.codePointAt(0);
+            // If contains any normal alphanumeric char, it's not "fully" bold
+            if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || (cp >= 0x30 && cp <= 0x39)) {
+                return false;
+            }
+            // If contains bold alphanumeric char
+            if ((cp >= 0x1D400 && cp <= 0x1D419) || (cp >= 0x1D41A && cp <= 0x1D433) || (cp >= 0x1D7CE && cp <= 0x1D7D7)) {
+                hasBold = true;
+            }
+        }
+        return hasBold;
+    }
+
+    function performBoldAction(type) {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        editor.edit(editBuilder => {
+            editor.selections.forEach(selection => {
+                const text = editor.document.getText(selection);
+                if (!text) return;
+
+                let newText = text;
+                const boldCheck = isBold(text);
+
+                if (type === 'on') {
+                     newText = toBold(text);
+                } else if (type === 'off') {
+                     newText = fromBold(text);
+                } else {
+                     // Toggle
+                     if (boldCheck) {
+                         newText = fromBold(text);
+                     } else {
+                         newText = toBold(text);
+                     }
+                }
+                
+                if (newText !== text) {
+                    editBuilder.replace(selection, newText);
+                }
+            });
+        });
+    }
+
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.boldify', () => performBoldAction('on')));
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.unboldify', () => performBoldAction('off')));
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleBoldify', () => performBoldAction('toggle')));
+
     // Initial update
     updateStatusBar();
     
@@ -521,7 +599,7 @@ function activate(context) {
                     
                     // Specific check for Product structure: products/[SKU]/[SKU].js
                     if (path.basename(path.dirname(dir)) === 'products') {
-                         const candidate = files.find(f => f === parentName + '.js');
+                         const candidate = files.find(f => (f.startsWith(parentName + '.') || f === parentName + '.js') && f.endsWith('.js') && !f.endsWith('thumbs.js'));
                          if (candidate) {
                              jsFile = path.join(dir, candidate);
                              sku = parentName;
@@ -690,284 +768,817 @@ function activate(context) {
     context.subscriptions.push(cacheWatcher);
     
     // --- End Translation Status Bar Logic ---
+
+    // --- DocumentLinkProvider (Enhanced for Thumbs & CSS) ---
     const provider = {
-        provideDocumentLinks(document, token) {
-            // outputChannel.appendLine(`[${new Date().toISOString()}] ProvideDocumentLinks called for: ${document.fileName}`);
+        async provideDocumentLinks(document, token) {
             const text = document.getText();
-            // Regex to match file://${var}/path...
-            const regex = /(file:\/\/\$\{([^}]+)\}([^"'\s]*))/g;
             const links = [];
+            const docUri = document.uri;
+            const docDir = path.dirname(docUri.fsPath);
+            const wFolders = vscode.workspace.workspaceFolders;
+
+            // Helper: Async check for file existence via diverse strategies (With Dist Fallback)
+            const resolvePath = async (linkText) => {
+                 const cleanLink = linkText.replace(/^\.\//, '').replace(/^\//, '');
+                 
+                 // Strategy A: Direct Resolution
+                 let candidates = [];
+                 
+                 // 1. Relative
+                 candidates.push(path.join(docDir, linkText));
+                 
+                 // 2. Workspace Roots
+                 if (wFolders) {
+                     for (const folder of wFolders) {
+                         candidates.push(path.join(folder.uri.fsPath, linkText));
+                         candidates.push(path.join(folder.uri.fsPath, cleanLink));
+                     }
+                 }
+
+                 // 3. Walk-Up / Heuristic
+                 if (linkText.includes('thumbs') || linkText.includes('css')) {
+                     let currentScanDir = docDir;
+                     let searchPart = cleanLink;
+                     if (cleanLink.includes('thumbs/')) searchPart = cleanLink.substring(cleanLink.indexOf('thumbs/'));
+                     for(let i=0; i<8; i++) {
+                         candidates.push(path.join(currentScanDir, searchPart));
+                         const nextDir = path.dirname(currentScanDir);
+                         if (nextDir === currentScanDir) break; 
+                         currentScanDir = nextDir;
+                     }
+                 }
+
+                 // Evaluate Candidates
+                 for (const cand of candidates) {
+                     if (fs.existsSync(cand)) {
+                         // Check if 0 bytes (empty) and try to find a better one in 'dist'
+                         try {
+                            const stats = fs.statSync(cand);
+                            if (stats.size === 0) {
+                                // Normalize for checking
+                                const normalized = cand.replace(/\\/g, '/');
+                                
+                                // Case 1: src -> dist
+                                if (normalized.includes('/src/')) {
+                                    const distCand = cand.replace(/[\\\/]src[\\\/]/, path.sep + 'dist' + path.sep);
+                                    if (fs.existsSync(distCand) && fs.statSync(distCand).size > 0) return distCand;
+                                }
+
+                                // Case 2: Special cache structure (website/src -> website/dist/cache/...)
+                                if (normalized.includes('website/src')) {
+                                     // Attempt to split and inject cache path
+                                     const parts = normalized.split('website/src');
+                                     if (parts.length >= 2) {
+                                         // Reconstruct using system separators
+                                         const prefix = parts[0].split('/').join(path.sep);
+                                         const suffix = parts[1].split('/').join(path.sep);
+                                         const cachePath = path.join(prefix, 'website', 'dist', 'cache', 'css', 'website', 'src', suffix);
+                                         
+                                         if (fs.existsSync(cachePath) && fs.statSync(cachePath).size > 0) return cachePath;
+                                     }
+                                }
+                            }
+                            return cand;
+                         } catch (e) { return cand; }
+                     }
+                 }
+                 
+                 // 4. Global Search (Last Resort)
+                 try {
+                    const foundFiles = await vscode.workspace.findFiles('**/' + cleanLink, '**/node_modules/**', 1);
+                    if (foundFiles.length > 0) return foundFiles[0].fsPath;
+                    const filename = path.basename(cleanLink);
+                    const foundFiles2 = await vscode.workspace.findFiles('**/' + filename, '**/node_modules/**', 1);
+                    if (foundFiles2.length > 0) return foundFiles2[0].fsPath;
+                 } catch (e) {}
+
+                 return null;
+            };
+
+            const existingLinks = []; 
+            // helper to push link (Safe for String path or Uri object)
+            const addLink = (start, end, target, tooltip) => {
+                 // Check for overlap
+                 for (const existing of existingLinks) {
+                     // If new range is completely within or identical to existing, skip
+                     if (start >= existing.start && end <= existing.end) return;
+                     // If new range fully covers existing, we might technically duplicate but usually we parse smaller tokens first? 
+                     // Actually let's just checking for substantial overlap or identity.
+                     if (start === existing.start && end === existing.end) return;
+                 }
+                 
+                 existingLinks.push({ start, end });
+
+                 const range = new vscode.Range(document.positionAt(start), document.positionAt(end));
+                 let targetUri = target;
+                 if (typeof target === 'string') {
+                     targetUri = vscode.Uri.file(target);
+                 }
+                 const link = new vscode.DocumentLink(range, targetUri);
+                 link.tooltip = tooltip || `Open ${path.basename(targetUri.fsPath)}`;
+                 links.push(link);
+            };
+
+
+
+
+            // 1. Variable substitution links: file://${VAR}/...
+            const varRegex = /(file:\/\/\$\{([^}]+)\}([^"'\s]*))/g;
             let match;
+            while ((match = varRegex.exec(text))) {
+                const fullMatch = match[1]; 
+                const varName = match[2];   
+                const remainder = match[3]; 
 
-            while ((match = regex.exec(text))) {
-                const fullMatch = match[1]; // file://${var}/...
-                const varName = match[2];   // var
-                const remainder = match[3]; // /path/to/file:Line#...
-
-                // outputChannel.appendLine(`Found match: ${fullMatch}`);
-
-                // Get variable value from configuration
                 const config = vscode.workspace.getConfiguration();
                 const varValue = config.get(varName);
 
-                // outputChannel.appendLine(`Variable '${varName}' resolved to: '${varValue}'`);
-
                 if (varValue && typeof varValue === 'string') {
-                    // Start index of the match
-                    const startPos = document.positionAt(match.index);
-                    const endPos = document.positionAt(match.index + fullMatch.length);
-
-                    // Parse the remainder for file path and line number
                     let filePathPart = remainder;
                     let line = 0;
                     
-                    // Check for Line number
-                    // remainder: /file.json:123
                     const lineMatch = /:(\d+)/.exec(remainder);
                     if (lineMatch) {
                         line = parseInt(lineMatch[1]);
                         const idx = remainder.lastIndexOf(':' + lineMatch[1]);
                         if (idx !== -1) filePathPart = remainder.substring(0, idx);
                     } else {
-                        // Check for hash and truncate
                         const hashIdx = remainder.indexOf('#');
                         if (hashIdx !== -1) filePathPart = remainder.substring(0, hashIdx);
                     }
 
-                    // Construct expanded path
                     let combined = path.join(varValue, filePathPart);
-                    // Normalize separators to slash
                     combined = combined.replace(/\\/g, '/');
                     
-                    // If it doesn't start with slash and has drive letter (e.g. D:/...), VS Code URI expects /D:/...
                     if (!combined.startsWith('/')) {
                         combined = '/' + combined;
                     }
 
-                    // outputChannel.appendLine(`Constructed path: ${combined}`);
-                    
                     let targetUri = vscode.Uri.file(combined);
-                    
-                    // Add fragment for line number
                     if (line > 0) {
                         targetUri = targetUri.with({ fragment: `L${line}` });
                     }
-                    
-                    // outputChannel.appendLine(`Final Target URI: ${targetUri.toString()}`);
 
-                    const range = new vscode.Range(startPos, endPos);
-                    const link = new vscode.DocumentLink(range, targetUri);
-                    link.tooltip = `Open ${combined}`;
-                    links.push(link);
-                } else {
-                    // outputChannel.appendLine(`WARNING: Could not resolve variable '${varName}'`);
+                    // Use addLink with URI
+                    addLink(match.index, match.index + fullMatch.length, targetUri, `Open ${combined}`);
                 }
             }
-            // outputChannel.appendLine(`Found ${links.length} links.`);
 
-            // outputChannel.appendLine(`[DATEx2] Scanning ${document.fileName} for custom links...`);
-            
-            // --- Custom DATEx2 Link Logic ---
-            // Unified Regex to support:
-            // product://SKU@Line:Col/path#html
-            
-            // Regex for new format
+            // 2. Custom DATEx2 Links: product://... profile@...
             const customRegex = /([\"'])(?:(product):([^@]+)@|(profile|category)@)([^\/]+)\/([^#\"']+?)(?:#([^\"']+))?\1/g;
-            
-            let customMatch;
-            while ((customMatch = customRegex.exec(text))) {
-                const fullMatchStr = customMatch[0];
-                let quote, type, hostPart, posPart, jsonPath, htmlPath;
+            while ((match = customRegex.exec(text))) {
+                const fullMatchStr = match[0];
+                let type, hostPart, posPart, jsonPath, htmlPath;
                 
-                quote = customMatch[1];
-                if (customMatch[2] === 'product') {
-                    // product:SLUG@... format
-                    type = customMatch[2];
-                    hostPart = customMatch[3];
-                    posPart = customMatch[5];
-                    jsonPath = customMatch[6];
-                    htmlPath = customMatch[7];
+                if (match[2] === 'product') {
+                    type = 'product';
+                    hostPart = match[3];
+                    posPart = match[5];
+                    jsonPath = match[6];
+                    htmlPath = match[7];
                 } else {
-                    // profile@ or category@ format
-                    type = customMatch[4];
+                    type = match[4];
                     hostPart = '';
-                    posPart = customMatch[5];
-                    jsonPath = customMatch[6];
-                    htmlPath = customMatch[7];
+                    posPart = match[5];
+                    jsonPath = match[6];
+                    htmlPath = match[7];
                 }
-                // Debug matching
-                // outputChannel.appendLine(`[DATEx2] Match: ${fullMatchStr}`);
-                // outputChannel.appendLine(`[DATEx2] Type: ${type}, Host: ${hostPart}, Pos: ${posPart}, Path: ${jsonPath}`);
 
                 let targetPath = '';
                 let targetLine = 1;
                 let targetCol = 1;
                 
-                // Parse Position
                 const posParts = posPart.split(':');
                 if (posParts.length > 0) targetLine = parseInt(posParts[0]);
                 if (posParts.length > 1) targetCol = parseInt(posParts[1]);
 
                 if (type === 'profile') {
-                    // profile@LINE:COL/path - opens db/profile/profile.js at line/col
                     targetPath = 'db/profile/profile.js';
                     if (htmlPath) {
                          targetPath = `db/profile/${htmlPath}`;
-                         targetLine = 1; 
-                         targetCol = 1;
+                         targetLine = 1; targetCol = 1;
                     }
                 } else if (type === 'category') {
-                    // category@LINE:COL/path - opens db/categories/categories.js at line/col
                     targetPath = 'db/categories/categories.js';
                     if (htmlPath) {
                         targetPath = `db/categories/${htmlPath}`;
-                        targetLine = 1;
-                        targetCol = 1;
+                        targetLine = 1; targetCol = 1;
                     }
                 } else if (type === 'product') {
                     const codeOrSlug = hostPart;
                     if (codeOrSlug) {
                         if (htmlPath) {
                              targetPath = `db/products/${codeOrSlug}/${htmlPath}`;
-                             targetLine = 1; 
-                             targetCol = 1;
+                             targetLine = 1; targetCol = 1;
                         } else {
-                            targetPath = `db/products/${codeOrSlug}/${codeOrSlug}.js`;
+                            // Link to Product JS: Discover file (slug.ID.js or slug.js)
+                            const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
+                            if (rootPath) {
+                                const productDir = path.join(rootPath, 'db/products', codeOrSlug);
+                                if (fs.existsSync(productDir)) {
+                                    const files = fs.readdirSync(productDir);
+                                    const targetFile = files.find(f => f.match(new RegExp(`^${codeOrSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.\\d+\\.js$`))) || `${codeOrSlug}.js`;
+                                    targetPath = `db/products/${codeOrSlug}/${targetFile}`;
+                                    // Verify existence?
+                                    if (!fs.existsSync(path.join(productDir, targetFile))) targetPath = null;
+                                } else {
+                                    targetPath = null;
+                                }
+                            }
                         }
                     }
                 }
 
                 if (targetPath) {
                      const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
-                     
                      if (rootPath) {
                          const absPath = path.join(rootPath, targetPath);
                          let targetUri = vscode.Uri.file(absPath);
-                         
                          if (targetLine > 0) {
                              targetUri = targetUri.with({ fragment: `L${targetLine}${targetCol > 1 ? ','+targetCol : ''}` });
                          }
                          
-                         const matchIndex = customMatch.index; 
-                         const startPos = document.positionAt(matchIndex + 1); 
-                         const endPos = document.positionAt(matchIndex + fullMatchStr.length - 1);
+                         const matchIndex = match.index; 
+                         const startChar = matchIndex + 1; 
+                         const endChar = matchIndex + fullMatchStr.length - 1;
                          
-                         const link = new vscode.DocumentLink(new vscode.Range(startPos, endPos), targetUri);
-                         link.tooltip = `Open ${targetPath} at line ${targetLine}:${targetCol}`;
-                         links.push(link);
+                         addLink(startChar, endChar, targetUri, `Open ${targetPath} at line ${targetLine}:${targetCol}`);
                      }
                 }
             }
 
-            // --- Data URI Support (Ctrl+Click) ---
-            // Support: quoted "data:..." or 'data:...' AND unquoted inside url(data:...)
+            // 3. Data URIs
             const dataUriRegex = /(["'])(data:[^"'\s]*)\1|url\((data:[^)"'\s]*)\)/g;
-            let dataMatch;
-            while ((dataMatch = dataUriRegex.exec(text))) {
-                 const isUnquoted = !!dataMatch[3];
-                 const fullUri = isUnquoted ? dataMatch[3] : dataMatch[2];
+            while ((match = dataUriRegex.exec(text))) {
+                 const isUnquoted = !!match[3];
+                 const fullUri = isUnquoted ? match[3] : match[2];
                  
                  let start, end;
                  if (isUnquoted) {
-                     start = dataMatch.index + 4; // url(
+                     start = match.index + 4; 
                      end = start + fullUri.length;
                  } else {
-                     start = dataMatch.index + 1; // " or '
+                     start = match.index + 1; 
                      end = start + fullUri.length;
                  }
 
                  const range = new vscode.Range(document.positionAt(start), document.positionAt(end));
-                 
                  const args = [fullUri];
                  const commandUri = vscode.Uri.parse(`command:datex2.openDataUri?${encodeURIComponent(JSON.stringify(args))}`);
                  
+                 // Manual link push to avoid addLink duplicate check (ranges differ slightly sometimes or we want specific tooltip control)
+                 // Actually better to use addLink if possible, but data URIs are distinct.
                  const link = new vscode.DocumentLink(range, commandUri);
                  link.tooltip = "Open Data URI in Browser";
                  links.push(link);
+            }
+
+            // Helper to get file size string
+            const getFileSize = (filePath) => {
+                try {
+                    const stats = fs.statSync(filePath);
+                    const sizeKB = (stats.size / 1024).toFixed(2);
+                    let info = `(${sizeKB} KB)`;
+                    
+                    // Check for .gz version
+                    const gzPath = filePath + '.gz';
+                    if (fs.existsSync(gzPath)) {
+                        const gzStats = fs.statSync(gzPath);
+                        const gzSizeKB = (gzStats.size / 1024).toFixed(2);
+                        info += ` | Gzip: (${gzSizeKB} KB)`;
+                    }
+                    return info;
+                } catch (e) {
+                    return '';
+                }
+            };
+
+            // 4. CSS Arrays in JS (css: ["file.css"])
+            const cssRegex = /(?:css|css360)\s*:\s*(\[[^\]]*\]|"[^"]*"|'[^']*')/g;
+            while ((match = cssRegex.exec(text))) {
+                 const arrayOrString = match[1];
+                 const arrayStart = match.index + match[0].indexOf(arrayOrString);
+                 
+                 // Extract strings inside
+                 const strRegex = /(['"])(.*?)\1/g;
+                 let strMatch;
+                 while ((strMatch = strRegex.exec(arrayOrString))) {
+                      const linkText = strMatch[2];
+                      if (!linkText.endsWith('.css') && !linkText.endsWith('.gz')) continue;
+
+                      // Exact position
+                      const localStart = strMatch.index + 1; // plus quote
+                      const absStart = arrayStart + localStart;
+                      const absEnd = absStart + linkText.length;
+                      
+                      const resolved = await resolvePath(linkText);
+                      if (resolved) {
+                           addLink(absStart, absEnd, vscode.Uri.file(resolved), `Reveal CSS File`);
+                      }
+                 }
+            }
+
+
+            // 5. Thumbs Paths (/thumbs/...)
+            // Matches: "/thumbs/filename.ext" or "./thumbs/filename.ext" or "thumbs/filename.ext"
+            const thumbsRegex = /["'](\.|\/)?\/?(thumbs\/[^"']+\.(webp|png|jpg|jpeg|css|gz))["']/g;
+            while ((match = thumbsRegex.exec(text))) {
+                  const fullMatch = match[0];
+                  const innerPath = match[2]; // thumbs/...
+                  
+                  // Calculate positions inside quotes
+                  const quoteStart = match.index; 
+                  // Find start of relevant path part inside the match
+                  const pathStartInMatch = fullMatch.indexOf(innerPath);
+                  const start = quoteStart + pathStartInMatch;
+                  const end = start + innerPath.length;
+
+                  // Thumbs also use resolvePath strategy now for consistency!
+                //   const resolved = await resolvePath(innerPath);
+                //   if (resolved) {
+                //        const sizeStr = getFileSize(resolved);
+                //        addLink(start, end, vscode.Uri.file(resolved), `Reveal File ${sizeStr}`);
+                //   }
+            }
+
+            // 6. Relative Workspace Paths (Generic)
+            // Matches strings starting with specific prefixes often used in this project
+            // e.g. "db/products/..." inside quotes
+            const relPathRegex = /["']((?:db|website|tools)\/[^"']+\.[a-zA-Z0-9]+)["']/g;
+            while ((match = relPathRegex.exec(text))) {
+                  const fullMatch = match[0];
+                  const innerPath = match[1];
+                  const quoteStart = match.index; 
+                  const start = quoteStart + 1; 
+                  const end = start + innerPath.length;
+
+                  // Use resolvePath
+                  const resolved = await resolvePath(innerPath);
+                  if (resolved) {
+                       addLink(start, end, vscode.Uri.file(resolved), `Reveal File`);
+                  }
             }
 
             return links;
         }
     };
 
-    // Command to open Data URI
-    context.subscriptions.push(vscode.commands.registerCommand('datex2.openDataUri', async (uriString) => {
+    // --- Helper to save Data URI to temp file ---
+    function saveDataUriToTemp(dataUri) {
         try {
-            // Create a temporary HTML file to display the image
-            // This avoids issues with OS command length limits or protocol handling for data: URIs
-            const tmpDir = require('os').tmpdir();
-            const tmpFile = path.join(tmpDir, 'datex2_image_preview.html');
-            
-            const htmlContent = `
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Image Preview</title>
-                    <style>
-                        body { 
-                            background-color: #1e1e1e; 
-                            display: flex; 
-                            justify-content: center; 
-                            align-items: center; 
-                            height: 100vh; 
-                            margin: 0; 
-                        }
-                        img { 
-                            max-width: 90%; 
-                            max-height: 90%; 
-                            box-shadow: 0 0 20px rgba(0,0,0,0.5); 
-                        }
-                    </style>
-                </head>
-                <body>
-                    <img src="${uriString}" />
-                </body>
-                </html>
-            `;
-            
-            fs.writeFileSync(tmpFile, htmlContent, 'utf8');
-            await vscode.env.openExternal(vscode.Uri.file(tmpFile));
-            
+            const matches = dataUri.match(/^data:image\/([a-zA-Z0-9+]+);base64,(.+)$/);
+            if (matches && matches.length === 3) {
+                let ext = matches[1];
+                if (ext.includes('svg')) ext = 'svg'; 
+                const base64Data = matches[2];
+                
+                const tmpDir = path.join(os.tmpdir(), 'datex2-smart-hover');
+                if (!fs.existsSync(tmpDir)) {
+                    fs.mkdirSync(tmpDir, { recursive: true });
+                }
+                
+                const hash = crypto.createHash('md5').update(base64Data).digest('hex');
+                const tmpFile = path.join(tmpDir, `img_${hash}.${ext}`);
+                
+                // Only write if not exists (caching)
+                if (!fs.existsSync(tmpFile)) {
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    fs.writeFileSync(tmpFile, buffer);
+                }
+                
+                return tmpFile;
+            }
         } catch (e) {
-            vscode.window.showErrorMessage('Failed to open data URI: ' + e.message);
+             console.error('Failed to process data URI:', e);
+        }
+        return null;
+    }
+
+    // Command to open external file
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.openExternalFile', (filePath) => {
+        try {
+            if (process.platform === 'win32') {
+                cp.exec(`start "" "${filePath}"`);
+            } else if (process.platform === 'darwin') {
+                cp.exec(`open "${filePath}"`);
+            } else {
+                cp.exec(`xdg-open "${filePath}"`);
+            }
+        } catch (e) {
+            vscode.window.showErrorMessage('Failed to open file: ' + e.message);
         }
     }));
 
-    // --- Image Preview Hover ---
+    // Command to Open Data URI
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.openDataUri', (dataUri) => {
+        const filePath = saveDataUriToTemp(dataUri);
+        if (filePath) {
+             vscode.commands.executeCommand('datex2.openExternalFile', filePath);
+        } else {
+             vscode.window.showErrorMessage('Failed to open Data URI image.');
+        }
+    }));
+
+    // Command to open file at specific location
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.openFileAtLocation', async (filePath, line, col) => {
+        if (!filePath) return;
+        try {
+            let targetUri;
+            if (typeof filePath === 'string') {
+                targetUri = vscode.Uri.file(filePath);
+            } else if (filePath instanceof vscode.Uri) {
+                targetUri = filePath;
+            } else {
+                 // Handle URIs passed as JSON objects (UriComponents) which might happen if args are serialized Uri objects
+                 if (filePath.scheme) {
+                     targetUri = vscode.Uri.from(filePath);
+                 } else {
+                     // Fallback, assume string path if possible or re-wrap
+                     targetUri = vscode.Uri.file(String(filePath));
+                 }
+            }
+
+            const doc = await vscode.workspace.openTextDocument(targetUri);
+            const editor = await vscode.window.showTextDocument(doc);
+            if (typeof line === 'number' && line > 0) {
+                const pos = new vscode.Position(line - 1, (col && col > 0) ? col - 1 : 0);
+                editor.selection = new vscode.Selection(pos, pos);
+                editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+            }
+        } catch (e) {
+            vscode.window.showErrorMessage(`Failed to open file: ${e.message}`);
+        }
+    }));
+
+    // --- Definition Provider (F12 Support) ---
+    const definitionProvider = {
+        async provideDefinition(document, position, token) {
+             const line = document.lineAt(position.line);
+             const text = line.text;
+             const docUri = document.uri;
+             const docDir = path.dirname(docUri.fsPath);
+             const wFolders = vscode.workspace.workspaceFolders;
+
+             // Helper for resolution (duplicated to be self-contained)
+             const resolvePath = async (linkText) => {
+                 const cleanLink = linkText.replace(/^\.\//, '').replace(/^\//, '');
+                 
+                 // 1. Relative
+                 const relativePath = path.join(docDir, linkText);
+                 if (fs.existsSync(relativePath)) return relativePath;
+
+                 // 2. Workspace Roots
+                 if (wFolders) {
+                     for (const folder of wFolders) {
+                         const rootPath = path.join(folder.uri.fsPath, linkText);
+                         if (fs.existsSync(rootPath)) return rootPath;
+                         const rootClean = path.join(folder.uri.fsPath, cleanLink);
+                         if (fs.existsSync(rootClean)) return rootClean;
+                     }
+                 }
+
+                 // 3. Walk-Up Heuristic
+                 if (linkText.includes('thumbs') || linkText.includes('css')) {
+                     let currentScanDir = docDir;
+                     let searchPart = cleanLink;
+                     if (cleanLink.includes('thumbs/')) searchPart = cleanLink.substring(cleanLink.indexOf('thumbs/'));
+
+                     for(let i=0; i<8; i++) {
+                         const candidate = path.join(currentScanDir, searchPart); 
+                         if (fs.existsSync(candidate)) return candidate;
+                         const nextDir = path.dirname(currentScanDir);
+                         if (nextDir === currentScanDir) break; 
+                         currentScanDir = nextDir;
+                     }
+                 }
+
+                 // 4. Global Search
+                 try {
+                    const filename = path.basename(cleanLink);
+                    const foundFiles = await vscode.workspace.findFiles('**/' + cleanLink, '**/node_modules/**', 1);
+                    if (foundFiles.length > 0) return foundFiles[0].fsPath;
+                    const foundFiles2 = await vscode.workspace.findFiles('**/' + filename, '**/node_modules/**', 1);
+                    if (foundFiles2.length > 0) return foundFiles2[0].fsPath;
+                 } catch (e) {}
+
+                 return null;
+             };
+
+             // Check for CSS Arrays: css: ["..."]
+             // We check if cursor is inside a string that looks like a file path
+             const range = document.getWordRangeAtPosition(position, /["']([^"']+)["']/);
+             if (range) {
+                 const fullMatch = document.getText(range);
+                 const inner = fullMatch.substring(1, fullMatch.length - 1);
+                 
+                 // If it ends with .css or has slash, try to resolve
+                 if (inner.endsWith('.css') || inner.includes('/')) {
+                     const valid = await resolvePath(inner);
+                     if (valid) {
+                         return new vscode.Location(vscode.Uri.file(valid), new vscode.Position(0, 0));
+                     }
+                 }
+             }
+             
+             return null;
+        }
+    };
+    context.subscriptions.push(vscode.languages.registerDefinitionProvider(['json', 'javascript', 'html', 'css', 'scss', 'less'], definitionProvider));
+
+
     context.subscriptions.push(vscode.languages.registerHoverProvider(['json', 'javascript', 'html', 'css', 'scss', 'less'], {
-        provideHover(document, position, token) {
+        async provideHover(document, position, token) {
             const line = document.lineAt(position.line);
             const text = line.text;
-            // Regex for quoted OR url(...) unquoted
+            const docUri = document.uri;
+            const docDir = path.dirname(docUri.fsPath);
+            const wFolders = vscode.workspace.workspaceFolders;
+
+            // Helper: Resolve Path
+             const resolvePath = async (linkText) => {
+                 const cleanLink = linkText.replace(/^\.\//, '').replace(/^\//, '');
+                 
+                 // Strategy A: Direct Resolution
+                 let candidates = [];
+                 
+                 // 1. Relative
+                 candidates.push(path.join(docDir, linkText));
+                 
+                 // 2. Workspace Roots
+                 if (wFolders) {
+                     for (const folder of wFolders) {
+                         candidates.push(path.join(folder.uri.fsPath, linkText));
+                         candidates.push(path.join(folder.uri.fsPath, cleanLink));
+                     }
+                 }
+
+                 // 3. Walk-Up / Heuristic
+                 if (linkText.includes('thumbs') || linkText.includes('css')) {
+                     let currentScanDir = docDir;
+                     let searchPart = cleanLink;
+                     if (cleanLink.includes('thumbs/')) searchPart = cleanLink.substring(cleanLink.indexOf('thumbs/'));
+                     for(let i=0; i<8; i++) {
+                         candidates.push(path.join(currentScanDir, searchPart));
+                         const nextDir = path.dirname(currentScanDir);
+                         if (nextDir === currentScanDir) break; 
+                         currentScanDir = nextDir;
+                     }
+                 }
+
+                 // Evaluate Candidates
+                 for (const cand of candidates) {
+                     if (fs.existsSync(cand)) {
+                         // Check if 0 bytes (empty) and try to find a better one in 'dist'
+                         try {
+                            const stats = fs.statSync(cand);
+                            if (stats.size === 0) {
+                                // Normalize for checking
+                                const normalized = cand.replace(/\\/g, '/');
+                                
+                                // Case 1: src -> dist
+                                if (normalized.includes('/src/')) {
+                                    const distCand = cand.replace(/[\\\/]src[\\\/]/, path.sep + 'dist' + path.sep);
+                                    if (fs.existsSync(distCand) && fs.statSync(distCand).size > 0) return distCand;
+                                }
+
+                                // Case 2: Special cache structure (website/src -> website/dist/cache/...)
+                                if (normalized.includes('website/src')) {
+                                     const parts = normalized.split('website/src');
+                                     if (parts.length >= 2) {
+                                         const prefix = parts[0].split('/').join(path.sep);
+                                         const suffix = parts[1].split('/').join(path.sep);
+                                         const cachePath = path.join(prefix, 'website', 'dist', 'cache', 'css', 'website', 'src', suffix);
+                                         if (fs.existsSync(cachePath) && fs.statSync(cachePath).size > 0) return cachePath;
+                                     }
+                                }
+                            }
+                            return cand;
+                         } catch (e) { return cand; }
+                     }
+                 }
+
+                 try {
+                    const filename = path.basename(cleanLink);
+                    const foundFiles = await vscode.workspace.findFiles('**/' + cleanLink, '**/node_modules/**', 1);
+                    if (foundFiles.length > 0) return foundFiles[0].fsPath;
+                    const foundFiles2 = await vscode.workspace.findFiles('**/' + filename, '**/node_modules/**', 1);
+                    if (foundFiles2.length > 0) return foundFiles2[0].fsPath;
+                 } catch (e) {}
+                 return null;
+             };
+
+             // Helper: Get File Size (Markdown)
+             const getFileSizeMarkdown = (filePath) => {
+                try {
+                    const stats = fs.statSync(filePath);
+                    const sizeKB = stats.size / 1024;
+                    
+                    // Format size: MB if > 1024KB, otherwise KB
+                    let info = '';
+                    if (sizeKB > 1024) {
+                        const sizeMB = (sizeKB / 1024).toFixed(2);
+                        info = `${sizeMB}MB`;
+                    } else {
+                        info = `${sizeKB.toFixed(2)}KB`;
+                    }
+                    
+                    // Logic to find smallest compressed version
+                    // 1. Determine base search path (if src, try dist too)
+                    let searchPaths = [path.dirname(filePath)];
+                    const normalized = filePath.replace(/\\/g, '/');
+                    if (normalized.includes('/src/')) {
+                        const distDir = filePath.replace(/[\\\/]src[\\\/]/, path.sep + 'dist' + path.sep)
+                                                .substring(0, filePath.lastIndexOf(path.sep)); // this logic is slightly flawed for dirname, let's just use path replacement
+                        const distDir2 = path.dirname(filePath.replace(/[\\\/]src[\\\/]/, path.sep + 'dist' + path.sep));
+                        if (fs.existsSync(distDir2)) searchPaths.push(distDir2);
+                        
+                        // Check for cache path logic website/src -> website/dist/cache...
+                        if (normalized.includes('website/src')) {
+                             const parts = normalized.split('website/src');
+                             if (parts.length >= 2) {
+                                 const prefix = parts[0].split('/').join(path.sep);
+                                 const suffix = path.dirname(parts[1]).split('/').join(path.sep);
+                                 const cachePath = path.join(prefix, 'website', 'dist', 'cache', 'css', 'website', 'src', suffix);
+                                 if (fs.existsSync(cachePath)) searchPaths.push(cachePath);
+                             }
+                        }
+                    }
+
+                    const baseName = path.basename(filePath);
+                    // Candidates to check in all searchPaths
+                    // Prefer minified versions for compression check
+                    let namesToCheck = [baseName];
+                    if (baseName.endsWith('.css') && !baseName.includes('.min.css')) {
+                        namesToCheck.push(baseName.replace('.css', '.min.css'));
+                    }
+
+                    const extensions = [
+                        { ext: '.br', label: 'BR' },
+                        { ext: '.gz', label: 'GZIP' },
+                        { ext: '.zstd', label: 'ZSTD' }
+                    ];
+
+                    let bestCompressed = null;
+
+                    for (const dir of searchPaths) {
+                        for (const name of namesToCheck) {
+                            for (const alg of extensions) {
+                                const checkPath = path.join(dir, name + alg.ext);
+                                if (fs.existsSync(checkPath)) {
+                                    try {
+                                        const cStats = fs.statSync(checkPath);
+                                        if (cStats.size > 0) {
+                                            if (!bestCompressed || cStats.size < bestCompressed.size) {
+                                                bestCompressed = {
+                                                    path: checkPath,
+                                                    size: cStats.size,
+                                                    label: alg.label
+                                                };
+                                            }
+                                        }
+                                    } catch (e) {}
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestCompressed) {
+                        const cSizeKB = bestCompressed.size / 1024;
+                        let cSizeStr = '';
+                        if (cSizeKB > 1024) {
+                            cSizeStr = `${(cSizeKB / 1024).toFixed(2)}MB`;
+                        } else {
+                            cSizeStr = `${cSizeKB.toFixed(2)}KB`;
+                        }
+                        
+                        const saving = ((bestCompressed.size - stats.size) / stats.size * 100).toFixed(0);
+                        // Add percentage if there is a reduction
+                        const percentStr = saving < 0 ? ` <span style="color:#FFD700;">${saving}%</span>` : '';
+                        info += ` (${bestCompressed.label} **${cSizeStr}**${percentStr})`;
+                    }
+
+                    return info;
+                } catch (e) {
+                    return '';
+                }
+            };
+            
+            // 1. Data URIs
             const dataUriRegex = /(["'])(data:image\/[^"'\s]*)\1|url\((data:image\/[^)"'\s]*)\)/g;
             let match;
             while ((match = dataUriRegex.exec(text))) {
                 const isUnquoted = !!match[3];
                 const dataUri = isUnquoted ? match[3] : match[2];
-                
                 let startOfData, endOfData;
-                if (isUnquoted) {
-                     startOfData = match.index + 4;
-                     endOfData = startOfData + dataUri.length;
-                } else {
-                     startOfData = match.index + 1;
-                     endOfData = startOfData + dataUri.length;
-                }
+                if (isUnquoted) { startOfData = match.index + 4; endOfData = startOfData + dataUri.length; } 
+                else { startOfData = match.index + 1; endOfData = startOfData + dataUri.length; }
 
                 if (position.character >= startOfData && position.character <= endOfData) {
+                    const config = vscode.workspace.getConfiguration('datex2.hover.dataUri');
+                    if (!config.get('enabled')) return null;
+
+                    const maxWidth = config.get('maxWidth') || 300;
+                    const showFileSize = config.get('showFileSize');
+
+                    let sizeInfo = '';
+                    const sizeInBytes = Math.round((dataUri.length - 22) * 3 / 4); 
+                    if (showFileSize) {
+                        const sizeKB = (sizeInBytes / 1024).toFixed(2);
+                        sizeInfo = ` (${sizeKB} KB)`;
+                    }
+
+                    // Large Data URI Handling
+                    let imageSrc = dataUri;
+                    const filePathForOpen = saveDataUriToTemp(dataUri);
+                    if (filePathForOpen && dataUri.length > 50000) {
+                        imageSrc = vscode.Uri.file(filePathForOpen).toString();
+                    }
+                    
                     const md = new vscode.MarkdownString();
-                    md.supportHtml = true;
-                    md.isTrusted = true;
-                    md.appendMarkdown(`![Image Preview](${dataUri})`);
+                    md.supportHtml = true; md.isTrusted = true;
+                    
+                    let imageHtml = `<img src="${imageSrc}" width="${maxWidth}" alt="Image Preview" />`;
+                    if (filePathForOpen) {
+                        const args = encodeURIComponent(JSON.stringify([filePathForOpen]));
+                        const cmd = `command:datex2.openExternalFile?${args}`;
+                        imageHtml = `<a href="${cmd}" title="Open in System Viewer">${imageHtml}</a>`;
+                    }
+                    md.appendMarkdown(`**Data URI Image${sizeInfo}**\n\n${imageHtml}`);
                     return new vscode.Hover(md);
                 }
             }
+            
+            // 2. CSS Files
+            const cssRegex = /(?:css|css360)\s*:\s*(\[[^\]]*\]|"[^"]*"|'[^']*')/g;
+            while ((match = cssRegex.exec(text))) {
+                  const arrayOrString = match[1];
+                  const arrayStart = match.index + match[0].indexOf(arrayOrString);
+                  const strRegex = /(['"])(.*?)\1/g;
+                  let strMatch;
+                  while ((strMatch = strRegex.exec(arrayOrString))) {
+                       const linkText = strMatch[2];
+                       if (!linkText.endsWith('.css') && !linkText.endsWith('.gz')) continue;
+
+                       const localStart = strMatch.index + 1;
+                       const absStart = arrayStart + localStart;
+                       const absEnd = absStart + linkText.length;
+                       
+                       if (position.character >= absStart && position.character <= absEnd) {
+                            const resolved = await resolvePath(linkText);
+                            if (resolved) {
+                                const sizeMd = getFileSizeMarkdown(resolved);
+                                const md = new vscode.MarkdownString();
+                                md.appendMarkdown(`**${path.basename(resolved)}** ${sizeMd}`);
+                                return new vscode.Hover(md);
+                            }
+                       }
+                  }
+            }
+
+            // 3. Thumbs / Generic / Relative Paths
+            // Combine strict thumbs check + generic path check into one pass or separate
+            const pathsRegex = /["'](\.|\/)?\/?((?:thumbs|db|website|tools)\/[^"']+\.[a-zA-Z0-9]+)["']/g;
+            while ((match = pathsRegex.exec(text))) {
+                const innerPath = match[2];
+                const start = match.index + match[0].indexOf(innerPath);
+                const end = start + innerPath.length;
+                
+                if (position.character >= start && position.character <= end) {
+                     const resolved = await resolvePath(innerPath);
+                     if (resolved) {
+                         const sizeMd = getFileSizeMarkdown(resolved);
+                         const isImage = /\.(webp|png|jpg|jpeg|svg|gif)$/i.test(resolved);
+                         
+                         const md = new vscode.MarkdownString();
+                         md.supportHtml = true; md.isTrusted = true;
+
+                         md.appendMarkdown(`**${path.basename(resolved)}** ${sizeMd}`);
+                         
+                         if (isImage) {
+                             const config = vscode.workspace.getConfiguration('datex2.hover.thumbs');
+                             if (config.get('enabled')) {
+                                const maxWidth = config.get('maxWidth') || 300;
+                                const fileUri = vscode.Uri.file(resolved);
+                                const args = encodeURIComponent(JSON.stringify([resolved]));
+                                const cmd = `command:datex2.openExternalFile?${args}`;
+                                md.appendMarkdown(`\n\n<a href="${cmd}" title="Open in System Viewer"><img src="${fileUri.toString()}" width="${maxWidth}" alt="Preview" /></a>`);
+                             }
+                         }
+                         
+                         return new vscode.Hover(md);
+                     }
+                }
+            }
+
             return null;
         }
     }));
 
-    // Register Link Provider with CSS support
     context.subscriptions.push(vscode.languages.registerDocumentLinkProvider(['json', 'javascript', 'html', 'css', 'scss', 'less'], provider));
+
+    // Remove old definition provider for thumbs to avoid conflict/double-behavior
+
 
     // Terminal Link Provider
     context.subscriptions.push(vscode.window.registerTerminalLinkProvider({
@@ -1477,6 +2088,22 @@ function activate(context) {
         if (!filePath) return;
 
         const currentLineText = document.lineAt(selection.line).text;
+
+        // --- Check for Thumbs / Definition Trigger (F12 override) ---
+        // If we are on a thumb path, delegate to the DefinitionProvider
+        const thumbRegex = /["']((?:\.?\/)?thumbs\/[^"']+\.(webp|png|jpg|jpeg))["']/;
+        if (document.getWordRangeAtPosition(selection, thumbRegex)) {
+            vscode.commands.executeCommand('editor.action.revealDefinition');
+            return;
+        }
+        if (document.fileName.endsWith('thumbs.json')) {
+             const jsonKeyRegex = /["']([^"']+\.(webp|png|jpg|jpeg))["']/;
+             if (document.getWordRangeAtPosition(selection, jsonKeyRegex)) {
+                  vscode.commands.executeCommand('editor.action.revealDefinition');
+                  return;
+             }
+        }
+        // -------------------------------------------------------------
         
         // 1. Navigation from JS/JSON -> HTML (on load('...'))
         // 1. Navigation from JS/JSON -> HTML (on load('...'))
@@ -1588,19 +2215,47 @@ function activate(context) {
         const isSourceJs = (ext === '.js');
 
         if (isSourceJs) {
-            try {
+            // JS -> JSON
+            // Current is slug.ID.js or slug.js
+            // Target is slug.ID.json or slug.json
+            const jsonFile = basement + '.json'; // slug.ID.json
+            if (fs.existsSync(path.join(dir, jsonFile))) {
+                targetPath = path.join(dir, jsonFile);
+            } else {
+                // If we are slug.js, look for slug.ID.json
+                // basement=slug
                 const files = fs.readdirSync(dir);
                 const target = files.find(f => f.startsWith(basement + '.') && f.match(/\.\d+\.json$/));
                 if (target) targetPath = path.join(dir, target);
-            } catch (e) {}
-        } else if (ext === '.json') {
-            const baseParts = basement.split('.');
-            if (baseParts.length > 1 && /^\d+$/.test(baseParts[baseParts.length - 1])) {
-                baseParts.pop(); 
+                // else check standard matching name?
+                else if (fs.existsSync(path.join(dir, basement + '.json'))) targetPath = path.join(dir, basement + '.json');
             }
-            const candidateName = baseParts.join('.') + '.js';
-            const candPath = path.join(dir, candidateName);
-            if (fs.existsSync(candPath)) targetPath = candPath;
+        } else if (ext === '.json') {
+            // JSON -> JS
+            // Current is slug.ID.json or slug.json
+            const jsFile = basement + '.js'; // slug.ID.js
+            if (fs.existsSync(path.join(dir, jsFile))) {
+                targetPath = path.join(dir, jsFile);
+            } else {
+                // Remove ID suffix to find slug?
+                // If basement = slug.ID
+                const baseParts = basement.split('.');
+                if (baseParts.length > 1 && /^\d+$/.test(baseParts[baseParts.length - 1])) {
+                     baseParts.pop(); // Remove ID
+                     const slug = baseParts.join('.');
+                     // Check for slug.ID.js (maybe different ID? unlikely) or slug.js
+                     const files = fs.readdirSync(dir);
+                     const target = files.find(f => f.match(new RegExp(`^${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.\\d+\\.js$`)));
+                     if (target) targetPath = path.join(dir, target);
+                     else if (fs.existsSync(path.join(dir, slug + '.js'))) targetPath = path.join(dir, slug + '.js');
+                } else {
+                    // basement = slug (old format)
+                    // Look for slug.ID.js
+                     const files = fs.readdirSync(dir);
+                     const target = files.find(f => f.match(new RegExp(`^${basement.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.\\d+\\.js$`)));
+                     if (target) targetPath = path.join(dir, target);
+                }
+            }
         }
 
         if (!targetPath) {
@@ -1976,49 +2631,461 @@ function activate(context) {
 
 
     // --- Image Preview & Open Logic for Thumbnails ---
-    const THUMBS_DIR = 'd:\\DATEx2.bike\\GitHub\\bikeRAW\\Thumbnails\\';
+    // --- Image Preview, Open Logic & Autocomplete for Thumbnails ---
+    // Dynamic THUMBS_DIR based on workspace
+    const getThumbsDir = () => {
+        const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+            ? vscode.workspace.workspaceFolders[0].uri.fsPath
+            : '';
+        return rootPath ? path.join(rootPath, 'thumbs') : '';
+    };
 
-    const ImageThumbnailProvider = {
-        provideHover(document, position, token) {
-            const range = document.getWordRangeAtPosition(position, /["']([^"']+\.(webp|png|jpg|jpeg))["']/);
-            if (!range) return;
+    // Thumbs Registry Logic
+    let thumbsRegistryCache = null;
+    let thumbsLastModified = 0;
+    let lastLoadedPath = '';
 
-            const text = document.getText(range);
-            // remove quotes
-            const fileName = text.substring(1, text.length - 1);
+    const getThumbsRegistryPath = () => {
+        const config = vscode.workspace.getConfiguration();
+        const configuredPath = config.get('datex2.thumbsRegistryPath');
+        if (configuredPath) return configuredPath;
+        
+        // Fallback or default? 
+        // We can fallback to the hardcoded path if not set, or just return empty.
+        // Given user request "hai să nu hardodăm", we should probably rely on config.
+        // But for backward compatibility/immediate working state without manual config:
+        return 'd:\\DATEx2.bike\\GitHub\\bikeRAW\\Thumbnails\\thumbs.json'; 
+    };
+
+    const getThumbsRegistry = () => {
+        try {
+            const registryPath = getThumbsRegistryPath();
+            if (!registryPath || !fs.existsSync(registryPath)) return null;
             
-            const filePath = path.join(THUMBS_DIR, fileName);
-            if (fs.existsSync(filePath)) {
-                // Return image preview
-                const markdown = new vscode.MarkdownString(`### ${fileName}\n\n![${fileName}](${vscode.Uri.file(filePath).toString()})`);
-                markdown.baseUri = vscode.Uri.file(THUMBS_DIR);
-                markdown.supportHtml = true;
-                return new vscode.Hover(markdown, range);
+            // Check if path changed dynamically
+            if (registryPath !== lastLoadedPath) {
+                thumbsRegistryCache = null;
+                thumbsLastModified = 0;
+                lastLoadedPath = registryPath;
             }
-        },
 
-        provideDefinition(document, position, token) {
-            const range = document.getWordRangeAtPosition(position, /["']([^"']+\.(webp|png|jpg|jpeg))["']/);
-            if (!range) return;
+            const stats = fs.statSync(registryPath);
+            if (thumbsRegistryCache && stats.mtimeMs === thumbsLastModified) {
+                return thumbsRegistryCache;
+            }
+            const content = fs.readFileSync(registryPath, 'utf8');
+            thumbsRegistryCache = JSON.parse(content);
+            thumbsLastModified = stats.mtimeMs;
+            return thumbsRegistryCache;
+        } catch (e) {
+            console.error("Error reading thumbs.json", e);
+            return null;
+        }
+    };
+
+    const getProductsForImage = (imageName) => {
+        const registry = getThumbsRegistry();
+        if (!registry) return [];
+
+        const productsMap = new Map(); // slug -> { slug, filePath, line, col }
+
+        Object.values(registry).forEach(product => {
+            if (product.thumbs) {
+                Object.keys(product.thumbs).forEach(key => {
+                    if (key.endsWith(imageName) || key.endsWith('/' + imageName)) {
+                         const entry = product.thumbs[key];
+                         let foundRef = false;
+
+                         if (entry && entry.refs && Array.isArray(entry.refs)) {
+                            entry.refs.forEach(ref => {
+                                // ref format: path/to/Slug.js@line:col
+                                const parts = ref.split('@');
+                                const filePath = parts[0];
+                                const pos = parts[1];
+                                
+                                const pathParts = filePath.split('/');
+                                const slug = pathParts[pathParts.length - 1].replace('.js', '');
+                                
+                                if (!productsMap.has(slug)) {
+                                    let line = 1, col = 1;
+                                    if (pos) {
+                                        const posParts = pos.split(':');
+                                        if (posParts[0]) line = parseInt(posParts[0]);
+                                        if (posParts[1]) col = parseInt(posParts[1]);
+                                    }
+                                    productsMap.set(slug, { slug, filePath, line, col });
+                                }
+                                foundRef = true;
+                            });
+                        }
+                        
+                        // Fallback if no refs (or only loose match)
+                        if (!foundRef && product.slug) {
+                             if (!productsMap.has(product.slug)) {
+                                 productsMap.set(product.slug, { 
+                                     slug: product.slug, 
+                                     filePath: `db/products/${product.slug}/${product.slug}.js`, 
+                                     line: 1, 
+                                     col: 1 
+                                });
+                             }
+                        }
+                    }
+                });
+            }
+        });
+        return Array.from(productsMap.values()).sort((a,b) => a.slug.localeCompare(b.slug));
+    };
+
+
+    const PathCompletionProvider = {
+        provideCompletionItems(document, position) {
+            const range = document.getWordRangeAtPosition(position, /["']([^"']*)["']/);
+            if (!range) return undefined;
+
+            const fullString = document.getText(range);
+            // content inside quotes
+            const content = fullString.substring(1, fullString.length - 1);
             
-            const text = document.getText(range);
-            const fileName = text.substring(1, text.length - 1);
-            
-            const filePath = path.join(THUMBS_DIR, fileName);
-            if (fs.existsSync(filePath)) {
-                // Open external
-                // Windows specific
-                cp.exec(`start "" "${filePath}"`);
-                // Return null to stop VS Code from doing anything else
-                return null;
+            // Check if it looks like a thumbs path (empty or partial)
+            // match: "", "/thumbs", "/thumbs/", "./thumbs/..."
+            if (!content.includes('thumb')) return undefined;
+
+            const thumbsDir = getThumbsDir();
+            if (!thumbsDir || !fs.existsSync(thumbsDir)) return undefined;
+
+            try {
+                const files = fs.readdirSync(thumbsDir);
+                
+                // We will replace everything inside the quotes to ensure clean insertion
+                const start = range.start.translate(0, 1);
+                const end = range.end.translate(0, -1);
+                const replaceRange = new vscode.Range(start, end);
+
+                return files
+                    .filter(f => /\.(webp|png|jpg|jpeg)$/i.test(f))
+                    .map(file => {
+                        const item = new vscode.CompletionItem(file, vscode.CompletionItemKind.File);
+                        
+                        // Smart insert text: maintain existing prefix style if possible
+                        // But user typically wants full path. defaulting to standard relative path used in project.
+                        // Project seems to use "thumbs/file.webp" or "./thumbs/file.webp" or "/thumbs/..."
+                        // Let's stick to "/thumbs/" as implied by previous code or "thumbs/"
+                        
+                         // Fix: Ensure filterText matches the prefix user typed (e.g. ./thumbs/ vs /thumbs/)
+                        if (content.startsWith('./')) {
+                             item.insertText = `./thumbs/${file}`;
+                             item.filterText = `./thumbs/${file}`;
+                        } else if (content.startsWith('/')) {
+                             item.insertText = `/thumbs/${file}`;
+                             item.filterText = `/thumbs/${file}`;
+                        } else {
+                             item.insertText = `thumbs/${file}`;
+                             item.filterText = `thumbs/${file}`;
+                        }
+                        
+                        item.range = replaceRange;
+                        item.sortText = file; 
+
+                        const filePath = path.join(thumbsDir, file);
+                        const products = getProductsForImage(file);
+                        
+                        let mdContent = `### ${file}\n\n`;
+                        mdContent += `<img src="${vscode.Uri.file(filePath).toString()}" width="300" alt="${file}"/>\n\n`;
+                        
+                        if (products.length > 0) {
+                            mdContent += `**Products:**\n`;
+                            products.forEach(p => {
+                                mdContent += `- ${p}\n`;
+                            });
+                        } else {
+                            mdContent += `_(Not referenced in any known product)_\n`;
+                        }
+
+                        const markdown = new vscode.MarkdownString(mdContent);
+                        markdown.supportHtml = true;
+                        item.documentation = markdown;
+
+                        return item;
+                    });
+            } catch (e) {
+                console.error(e);
+                return [];
             }
         }
     };
 
-    context.subscriptions.push(vscode.languages.registerHoverProvider(['javascript', 'json'], ImageThumbnailProvider));
-    context.subscriptions.push(vscode.languages.registerDefinitionProvider(['javascript', 'json'], ImageThumbnailProvider));
+    // Trigger on / and usual chars for aggressive completion
+    context.subscriptions.push(vscode.languages.registerCompletionItemProvider(['javascript', 'json'], PathCompletionProvider, '/', '"', '\'', 't', 'h', 'u', 'm', 'b', 's'));
+
+
+    // --- Search Product By ID Logic ---
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.searchProductById', async () => {
+        const input = await vscode.window.showInputBox({
+            placeHolder: 'Enter Product ID (e.g. 532361501)',
+            prompt: 'Search for a product file containing this ID'
+        });
+
+        if (!input) return;
+
+        const targetId = input.trim();
+        // Regex to match: id: 12345 or id: "12345" or id: '12345'
+        const regex = new RegExp(`id\\s*:\\s*(["']?)${targetId}\\1`);
+
+        try {
+            const productFiles = await vscode.workspace.findFiles('db/products/**/*.js', '**/node_modules/**');
+            
+            let found = false;
+
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Searching for ID: ${targetId}...`,
+                cancellable: true
+            }, async (progress, token) => {
+                
+                for (const file of productFiles) {
+                    if (token.isCancellationRequested) break;
+                    
+                    const content = fs.readFileSync(file.fsPath, 'utf8');
+                    const match = content.match(regex);
+                    
+                    if (match) {
+                        found = true;
+                        const doc = await vscode.workspace.openTextDocument(file);
+                        const editor = await vscode.window.showTextDocument(doc);
+                        
+                        // Find line number
+                        const lines = content.split(/\r?\n/);
+                        const lineIdx = lines.findIndex(l => regex.test(l));
+                        
+                        if (lineIdx !== -1) {
+                            const pos = new vscode.Position(lineIdx, 0);
+                            editor.selection = new vscode.Selection(pos, pos);
+                            editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+                        }
+                        
+                        // Stop after first match? User implied "search", usually means unique ID. 
+                        break; 
+                    }
+                }
+
+                if (!found && !token.isCancellationRequested) {
+                    vscode.window.showInformationMessage(`No product found with ID: ${targetId}`);
+                }
+            });
+
+        } catch (e) {
+            vscode.window.showErrorMessage('Error searching products: ' + e.message);
+        }
+    }));
+
+    // --- Thumbs Cycling Logic (F12) ---
+    context.subscriptions.push(vscode.languages.registerDefinitionProvider(['javascript', 'json'], {
+        async provideDefinition(document, position, token) {
+            // 1. Identify if we are on a thumb path
+            // Regex for standard product files
+            const thumbRegex = /["']((?:\.?\/)?thumbs\/[^"']+\.(webp|png|jpg|jpeg))["']/;
+            let range = document.getWordRangeAtPosition(position, thumbRegex);
+            let fileName = null;
+            let offsetInFileName = 0;
+
+            if (range) {
+                const text = document.getText(range);
+                // Extract filename from "thumbs/foo.webp"
+                // Remove quotes
+                const content = text.substring(1, text.length - 1);
+                // content might be "thumbs/foo.webp" or "./thumbs/foo.webp"
+                const parts = content.split('/');
+                fileName = parts[parts.length - 1];
+                
+                // Calculate offset
+                const fNameIdx = text.indexOf(fileName);
+                if (fNameIdx !== -1) {
+                    const cursorOffset = position.character - range.start.character;
+                    offsetInFileName = Math.max(0, Math.min(fileName.length, cursorOffset - fNameIdx));
+                }
+            } else {
+                // Fallback for thumbs.json context (keys might be just filenames or paths without 'thumbs/' prefix)
+                if (document.fileName.endsWith('thumbs.json')) {
+                    // Match simple filename string with extension
+                    const jsonKeyRegex = /["']([^"']+\.(webp|png|jpg|jpeg))["']/;
+                    range = document.getWordRangeAtPosition(position, jsonKeyRegex);
+                    if (range) {
+                        const text = document.getText(range);
+                        let extracted = text.substring(1, text.length - 1);
+                        // If it has slashes, check if it's a path key
+                        if (extracted.includes('/')) {
+                             const parts = extracted.split('/');
+                             fileName = parts[parts.length - 1];
+                        } else {
+                            fileName = extracted;
+                        }
+                        
+                        const fNameIdx = text.indexOf(fileName);
+                        if (fNameIdx !== -1) {
+                            const cursorOffset = position.character - range.start.character;
+                            offsetInFileName = Math.max(0, Math.min(fileName.length, cursorOffset - fNameIdx));
+                        }
+                    }
+                }
+            }
+
+            if (!fileName) return null;
+
+            // 2. Get Registry
+            const registryPath = getThumbsRegistryPath();
+            if (!registryPath || !fs.existsSync(registryPath)) return null;
+
+            const registry = getThumbsRegistry();
+            if (!registry) return null;
+
+            // 3. Find Entry
+            let targetEntry = null;
+            let targetEntryKey = null;
+
+            for (const pKey in registry) {
+                const product = registry[pKey];
+                if (product.thumbs) {
+                    for (const tKey in product.thumbs) {
+                        if (tKey.endsWith(fileName) || tKey.endsWith('/' + fileName)) {
+                            targetEntry = product.thumbs[tKey];
+                            targetEntryKey = tKey;
+                            break;
+                        }
+                    }
+                }
+                if (targetEntry) break;
+            }
+
+            if (!targetEntry) return null;
+
+            // 4. Build Locations List (Main Key -> Refs)
+            const locations = []; // { uri, range }
+
+            // A. Add thumbs.json location (Main definition)
+            try {
+                const thumbsContent = fs.readFileSync(registryPath, 'utf8');
+                const thumbsLines = thumbsContent.split(/\r?\n/);
+                // Naive search for Key
+                const keyEscaped = targetEntryKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const keyRegex = new RegExp(`"${keyEscaped}"\\s*:`);
+                
+                let lineIdx = -1;
+                for (let i = 0; i < thumbsLines.length; i++) {
+                    if (keyRegex.test(thumbsLines[i])) {
+                        lineIdx = i;
+                        break;
+                    }
+                }
+                
+                if (lineIdx !== -1) {
+                    // Start position (will be refined if it's the target)
+                    // Default to start of key
+                    const lineText = thumbsLines[lineIdx];
+                    const keyStart = lineText.indexOf(targetEntryKey);
+                    let col = (keyStart !== -1) ? keyStart : 0;
+                    
+                    locations.push({
+                        uri: vscode.Uri.file(registryPath),
+                        range: new vscode.Range(lineIdx, col, lineIdx, col)
+                    });
+                }
+            } catch (e) { console.error("Error reading thumbs.json for definition", e); }
+
+            // B. Add Refs
+            const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
+            if (targetEntry.refs && Array.isArray(targetEntry.refs) && rootPath) {
+                for (const ref of targetEntry.refs) {
+                    // ref format: path/to/file.js@line:col
+                    if (!ref.includes('@')) continue; // skip unexpected format
+                    const parts = ref.split('@');
+                    const relPath = parts[0];
+                    const posStr = parts[1];
+                    let line = 0; 
+                    let col = 0;
+                    
+                    if (posStr) {
+                        const p = posStr.split(':');
+                        if (p[0]) line = parseInt(p[0]) - 1; // 1-based in string, 0-based in VSCode
+                        if (p[1]) col = parseInt(p[1]) - 1;
+                    }
+                    
+                    const absPath = path.join(rootPath, relPath);
+                    locations.push({
+                        uri: vscode.Uri.file(absPath),
+                        range: new vscode.Range(line, col, line, col)
+                    });
+                }
+            }
+
+            if (locations.length === 0) return null;
+
+            // 5. Determine Next Location
+            const docUriStr = document.uri.toString();
+            const curLine = position.line;
+            
+            let currentIndex = -1;
+            
+            // Find current location in list
+            for (let i = 0; i < locations.length; i++) {
+                const loc = locations[i];
+                if (loc.uri.toString() === docUriStr) {
+                    // Fuzzy match line (refs might be slightly off if file edited)
+                    if (Math.abs(loc.range.start.line - curLine) <= 2) {
+                        currentIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            // Logic:
+            // If we are at a known location, go to next.
+            // If unknown (new usage), go to Definition (thumbs.json, index 0).
+            let nextIndex = 0;
+            if (currentIndex !== -1) {
+                nextIndex = (currentIndex + 1) % locations.length;
+            }
+
+            const target = locations[nextIndex];
+            
+            // 6. Refine Target Range with Offset
+            // We want to land at fileName start + offsetInFileName
+            try {
+                // If it's thumbs.json, we already read it sort of, but let's be robust
+                let lineText = '';
+                if (target.uri.fsPath === registryPath) {
+                    // Re-read or cache? Simple re-read for now or reuse cache logic if optimizing
+                    // We can reuse the loop logic but simpler to just read line
+                     const thumbsContent = fs.readFileSync(registryPath, 'utf8');
+                     const thumbsLines = thumbsContent.split(/\r?\n/);
+                     if (thumbsLines[target.range.start.line]) lineText = thumbsLines[target.range.start.line];
+                } else {
+                     if (fs.existsSync(target.uri.fsPath)) {
+                         // Read only the needed line?
+                         // For simplicity read file
+                         const content = fs.readFileSync(target.uri.fsPath, 'utf8');
+                         const lines = content.split(/\r?\n/);
+                         if (lines[target.range.start.line]) lineText = lines[target.range.start.line];
+                     }
+                }
+
+                if (lineText) {
+                    // Find fileName in this line
+                    // We expect it to be near valid target.range.start.character
+                    // But naive indexOf is usually sufficient for these keys
+                    const idx = lineText.indexOf(fileName);
+                    if (idx !== -1) {
+                        const newCol = idx + offsetInFileName;
+                        return new vscode.Location(target.uri, new vscode.Range(target.range.start.line, newCol, target.range.start.line, newCol));
+                    }
+                }
+            } catch(e) {}
+
+            return new vscode.Location(target.uri, target.range);
+        }
+    }));
+
 
 } // End of activate
-
 exports.activate = activate;
 exports.deactivate = function() {};

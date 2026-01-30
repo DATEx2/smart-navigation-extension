@@ -16,8 +16,17 @@ This extension provides smart navigation features for DATEx2 development.
 *   **Press Ctrl+F12** on a text string or key in any file to jump to its entry in `translations.ai.cache.json`.
 *   **Press Ctrl+F12** inside the translation cache file to jump back to the referenced source file (using the "refs" property).
 
-### 3. Path Variable Expansion
+### 3. Thumbnail Reference Cycling (F12)
+*   **Press F12** while cursor is on a thumbnail path (e.g. `"thumbs/image.webp"`) in a `product.js` or `thumbs.json` file.
+*   **Cycles References:** Navigates from the usage -> registry definition (`thumbs.json`) -> each reference in other products -> back to usage.
+*   Allows quick inspection of where an image is used across the entire product catalog.
+
+### 4. Path Variable Expansion
 *   Resolves `${variable}` paths in JSON document links and keys.
+
+### 5. Enhanced Image Previews
+*   **Smart Data URI Handling:** Automatically offloads large `data:image` preview content (>~50KB) to temporary files to bypass VS Code's markdown hover limits, ensuring even high-resolution embedded images display correctly.
+
 
 
 ## Configuration
@@ -28,3 +37,15 @@ Set variables in your settings:
   "products": "/absolute/path/to/products"
 }
 ```
+
+## Development & Deployment
+
+**IMPORTANT FOR ANTIGRAVITY ENVIRONMENT:**
+
+When developing in the **Antigravity** environment, you **MUST** use the following command to bump the version, package, and **install** the extension immediately:
+
+```bash
+npm run update-package
+```
+
+Do **NOT** just run `npm run package` or `vsce package`, as this will not install the updated extension into the current active environment. The `update-package` script handles version bumping, packaging, and force-installing the `.vsix`.
