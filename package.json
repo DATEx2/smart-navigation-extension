@@ -3,7 +3,7 @@
   "publisher": "DATEx2",
   "displayName": "DATEx2 Smart Navigation",
   "icon": "assets/icon.webp",
-  "version": "0.1.152",
+  "version": "0.1.186",
   "repository": {
     "type": "git",
     "url": "https://github.com/DATEx2/smart-navigation-extension"
@@ -65,6 +65,7 @@
       {
         "command": "datex2.toggleTranslationFile",
         "key": "ctrl+f12",
+        "win": "ctrl+f12",
         "mac": "cmd+f12",
         "when": "editorTextFocus"
       },

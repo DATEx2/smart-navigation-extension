@@ -12,9 +12,9 @@ This extension provides smart navigation features for DATEx2 development.
 
 <img src="assets/icon.webp" alt="F12 Toggle Infographic" width="100%"/>
 
-### 2. Translation Cache Toggle (Ctrl+F12)
-*   **Press Ctrl+F12** on a text string or key in any file to jump to its entry in `translations.ai.cache.json`.
-*   **Press Ctrl+F12** inside the translation cache file to jump back to the referenced source file (using the "refs" property).
+### 2. Translation Cache Toggle (Ctrl+Alt+T)
+*   **Press Ctrl+Alt+T** on a text string or key in any file to jump to its entry in `translations.ai.cache.json`.
+*   **Press Ctrl+Alt+T** inside the translation cache file to jump back to the referenced source file (using the "refs" property).
 
 ### 3. Thumbnail Reference Cycling (F12)
 *   **Press F12** while cursor is on a thumbnail path (e.g. `"thumbs/image.webp"`) in a `product.js` or `thumbs.json` file.

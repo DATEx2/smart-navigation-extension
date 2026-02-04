@@ -6,11 +6,161 @@ const imageSize = require('image-size');
 const seoPreview = require('./seoPreview');
 const os = require('os');
 const crypto = require('crypto');
+const vm = require('vm');
 
 const outputChannel = vscode.window.createOutputChannel("Path Expander Debug");
 
 function activate(context) {
     seoPreview.activate(context);
+
+    // --- ID Highlighting Decorations ---
+    const attributeDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#0a5754', // Cyan/Greenish
+        fontWeight: 'bold'
+    });
+    
+    const categoryDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#a86128', // Brownish Orange
+        fontWeight: 'bold'
+    });
+
+    const lpSelfDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#fff176', // Light Yellow
+        fontWeight: 'bold'
+    });
+
+    function updateDecorations() {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || !['javascript', 'json'].includes(editor.document.languageId)) {
+            return;
+        }
+
+        const text = editor.document.getText();
+        const fileName = editor.document.fileName;
+        const attributeRanges = [];
+        const categoryRanges = [];
+        const lpSelfRanges = [];
+
+        // 0. Self-Referencing LP links (Yellow)
+        // Extract current ID from filename: e.g. Product.12345678.js
+        const currentFileIdMatch = fileName.match(/\.(\d+)\.js$/);
+        const currentId = currentFileIdMatch ? currentFileIdMatch[1] : null;
+
+        if (currentId) {
+            // Match lp: 12345678 or lp: "12345678"
+            const lpRegex = /\blp\s*:\s*(?:["']?)(\d+)(?:["']?)/g;
+            let lpMatch;
+            while ((lpMatch = lpRegex.exec(text))) {
+                 if (lpMatch[1] === currentId) {
+                     const startPos = editor.document.positionAt(lpMatch.index + lpMatch[0].lastIndexOf(lpMatch[1]));
+                     const endPos = editor.document.positionAt(lpMatch.index + lpMatch[0].lastIndexOf(lpMatch[1]) + lpMatch[1].length);
+                     lpSelfRanges.push(new vscode.Range(startPos, endPos));
+                 }
+            }
+        }
+
+        // 1. Attributes & ProductClass (Dark Gray)
+        // Matches: "productClassId": 123 or top-level list of attribute objects { id: 123... }
+        // For simple regex matching, we catch standard patterns
+        
+        // Match: productClassId: 123456
+        const pClassRegex = /(?:["']?)productClassId(?:["']?)\s*:\s*(\d+)/g;
+        let match;
+        while ((match = pClassRegex.exec(text))) {
+            const startPos = editor.document.positionAt(match.index + match[0].lastIndexOf(match[1]));
+            const endPos = editor.document.positionAt(match.index + match[0].lastIndexOf(match[1]) + match[1].length);
+            attributeRanges.push(new vscode.Range(startPos, endPos));
+        }
+
+        // Match: attributes: [ ... { id: 12345 ... ]
+        // This is harder with pure regex globally. We'll iterate through occurrences of "attributes" and parse somewhat locally or just target specific "id": 123 patterns if context implies.
+        // For robustness without full parser, let's look for "id": 123 patterns inside "attributes" block is tricky.
+        // SIMPLIFICATION: Look for any "id": 123 pattern? No, too generic.
+        // Let's assume the user format is consistent: { id: 12345, ... } inside arrays.
+        // A better heuristic for attributes: standard attribute IDs are often 9 digits starting with 16, 17, 18, 20, 21, 25?? The user's types.js shows 9 digits.
+        // Let's use a heuristic check: if "id": <9-digits> and followed by "name" or "type" nearby?
+        // OR simply scan for `attributes: [` and then find IDs inside that block.
+        
+        // Trying block scanning for 'attributes'
+        const attrBlockRegex = /attributes\s*:\s*\[([\s\S]*?)\]/g;
+        while ((match = attrBlockRegex.exec(text))) {
+            const blockStartWithPrefix = match.index;
+            const blockContent = match[1];
+            const blockStartOffset = match[0].indexOf(blockContent);
+            const absoluteBlockStart = blockStartWithPrefix + blockStartOffset;
+            
+            const idRegex = /(?:["']?)\bid\b(?:["']?)\s*:\s*(\d+)/g;
+            let idMatch;
+            while ((idMatch = idRegex.exec(blockContent))) {
+                const idVal = idMatch[1];
+                const startPos = editor.document.positionAt(absoluteBlockStart + idMatch.index + idMatch[0].lastIndexOf(idVal));
+                const endPos = editor.document.positionAt(absoluteBlockStart + idMatch.index + idMatch[0].lastIndexOf(idVal) + idVal.length);
+                attributeRanges.push(new vscode.Range(startPos, endPos));
+            }
+        }
+        
+        // Also check if we are in types.js (where structure is different)
+        if (editor.document.fileName.includes('types.js')) {
+             const idRegex = /(?:["']?)\bid\b(?:["']?)\s*:\s*(\d{8,12})/g;
+             while ((match = idRegex.exec(text))) {
+                 const idVal = match[1];
+                 // Just color all IDs in types.js as gray as they define attributes/classes? 
+                 // User prompted "attributes/id and productClassId". In types.js main IDs are classes, attribute IDs are attributes.
+                 const startPos = editor.document.positionAt(match.index + match[0].lastIndexOf(idVal));
+                 const endPos = editor.document.positionAt(match.index + match[0].lastIndexOf(idVal) + idVal.length);
+                 attributeRanges.push(new vscode.Range(startPos, endPos));
+             }
+        }
+
+
+        // 2. Categories (Dark Orange)
+        // Match: defaultCategoryId: 123456
+        const defCatRegex = /(?:["']?)defaultCategoryId(?:["']?)\s*:\s*(\d+)/g;
+        while ((match = defCatRegex.exec(text))) {
+             const startPos = editor.document.positionAt(match.index + match[0].lastIndexOf(match[1]));
+             const endPos = editor.document.positionAt(match.index + match[0].lastIndexOf(match[1]) + match[1].length);
+             categoryRanges.push(new vscode.Range(startPos, endPos));
+        }
+
+        // Match: categories: [ ... { id: 12345 ... ]
+        const catBlockRegex = /categories\s*:\s*\[([\s\S]*?)\]/g;
+        while ((match = catBlockRegex.exec(text))) {
+            const blockStartWithPrefix = match.index;
+            const blockContent = match[1];
+            const blockStartOffset = match[0].indexOf(blockContent);
+            const absoluteBlockStart = blockStartWithPrefix + blockStartOffset;
+            
+            const idRegex = /(?:["']?)\bid\b(?:["']?)\s*:\s*(\d+)/g;
+            let idMatch;
+            while ((idMatch = idRegex.exec(blockContent))) {
+                const idVal = idMatch[1];
+                // Avoid highlighting "orderBy" or other nums, ensuring it's "id": ...
+                const startPos = editor.document.positionAt(absoluteBlockStart + idMatch.index + idMatch[0].lastIndexOf(idVal));
+                const endPos = editor.document.positionAt(absoluteBlockStart + idMatch.index + idMatch[0].lastIndexOf(idVal) + idVal.length);
+                categoryRanges.push(new vscode.Range(startPos, endPos));
+            }
+        }
+
+        editor.setDecorations(attributeDecorationType, attributeRanges);
+        editor.setDecorations(categoryDecorationType, categoryRanges);
+        editor.setDecorations(lpSelfDecorationType, lpSelfRanges);
+    }
+
+    // Trigger updates
+    vscode.window.onDidChangeActiveTextEditor(() => {
+        updateDecorations();
+    }, null, context.subscriptions);
+
+    vscode.workspace.onDidChangeTextDocument(event => {
+        if (vscode.window.activeTextEditor && event.document === vscode.window.activeTextEditor.document) {
+             updateDecorations();
+        }
+    }, null, context.subscriptions);
+    
+    // Initial run
+    if (vscode.window.activeTextEditor) {
+        updateDecorations();
+    }
     // --- Translation Status Bar Logic ---
     const missingItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     const percentItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
@@ -68,6 +218,21 @@ function activate(context) {
 
     async function updateStatusBar() {
         const productFiles = await vscode.workspace.findFiles('db/products/**/*.js', '**/node_modules/**');
+        
+        // Populate global map for fast lookups (refs)
+        global.datex2ProductMap = {};
+        for (const file of productFiles) {
+            const name = path.basename(file.fsPath, '.js');
+            global.datex2ProductMap[name] = file.fsPath;
+            // Handle SKU.id.js -> map SKU to it if not present (heuristic)
+            if (name.match(/\.\d+$/)) {
+                const sku = name.substring(0, name.lastIndexOf('.'));
+                if (!global.datex2ProductMap[sku]) {
+                     global.datex2ProductMap[sku] = file.fsPath;
+                }
+            }
+        }
+
         let total = 0;
         let missing = 0;
         let cacheMissing = 0;
@@ -362,6 +527,460 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('datex2.boldify', () => performBoldAction('on')));
     context.subscriptions.push(vscode.commands.registerCommand('datex2.unboldify', () => performBoldAction('off')));
     context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleBoldify', () => performBoldAction('toggle')));
+
+    // --- Toggle Translation / Product File Logic ---
+    let lastProductEditorUri = null;
+
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleTranslationFile', async () => {
+        try {
+            console.log('DATEx2: toggleTranslationFile triggered');
+            const editor = vscode.window.activeTextEditor;
+            const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+                ? vscode.workspace.workspaceFolders[0].uri.fsPath
+                : null;
+            
+            if (!rootPath) return;
+            const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+
+            if (!editor) return;
+
+            const document = editor.document;
+            const filePath = document.fileName;
+            
+            // --- Helper: Get Key from line "key": "val" ---
+            const getKeyVal = (lineText) => {
+                const match = lineText.match(/^\s*(["'])((?:(?!\1)[^\\]|\\.)*?)\1\s*:\s*(["'])((?:(?!\3)[^\\]|\\.)*?)\3/);
+                if (match) return { key: match[2], val: match[4] };
+                // Also match simple objects like { lp: ..., text: "..." }
+                // This is harder with regex, but let's try to find "text": "..."
+                const textMatch = lineText.match(/(?:^|,\s*)text\s*:\s*(["'])((?:(?!\1)[^\\]|\\.)*?)\1/);
+                if (textMatch) return { key: 'text', val: textMatch[2] };
+                
+                return { key: null, val: null };
+            };
+
+            if (filePath.toLowerCase() === cachePath.toLowerCase()) {
+                // We are in cache file, switch back
+                if (!lastProductEditorUri) {
+                     vscode.window.showErrorMessage('No previous file to return to.');
+                     return; 
+                }
+
+                // Reverse Navigation: Cycle through refs
+                // 1. Identify current key in cache file
+                const selection = editor.selection.active;
+                // Find containing key -> search upwards for "KEY": {
+                let keyLine = selection.line;
+                let keyText = null;
+                
+                // Scan upwards to find the key line
+                while (keyLine >= 0) {
+                    const lineText = document.lineAt(keyLine).text;
+                     // Regex for "KEY": {
+                    const match = lineText.match(/^\s*"((?:[^"\\]|\\.)*)"\s*:\s*\{/);
+                    if (match) {
+                        keyText = match[1];
+                        break;
+                    }
+                    // Stop if we hit end of another object "}," (but careful with nested objects)
+                    // If indentation decreases, we might have gone too far up?
+                    // Simplified: Just match "KEY": {
+                    keyLine--;
+                }
+
+                if (!keyText) {
+                    // Fallback to simple jump back
+                    try {
+                        const doc = await vscode.workspace.openTextDocument(lastProductEditorUri);
+                        await vscode.window.showTextDocument(doc);
+                    } catch (e) { vscode.window.showErrorMessage('Could not open previous file.'); }
+                    return;
+                }
+
+                // 2. Parse cache JSON to find refs for this key
+                // Since JSON is huge, we should parse just this block or use regex to find "refs": [ ... ]
+                // under this key.
+                const text = document.getText();
+                // Find "refs": [ ... ] after the keyLine
+                const keyIndex = document.offsetAt(new vscode.Position(keyLine, 0));
+                // Limit search window
+                const searchWindow = text.substring(keyIndex, keyIndex + 5000); 
+                
+                // Extract refs array content match
+                const refsMatch = searchWindow.match(/"refs"\s*:\s*\[([\s\S]*?)\]/);
+                
+                let targetUri = lastProductEditorUri;
+                let targetSelection = null;
+
+                if (refsMatch) {
+                    const refsContent = refsMatch[1];
+                    // Parse strings inside
+                    const refStrings = [];
+                    const refRegex = /"([^"]+)"/g;
+                    let m;
+                    while ((m = refRegex.exec(refsContent)) !== null) {
+                        refStrings.push(m[1]);
+                    }
+                    
+                    if (refStrings.length > 0) {
+                        // Strategy: Cycle through refs
+                        if (!global.datex2RefIndex) global.datex2RefIndex = {};
+                        
+                        let currentIndex = global.datex2RefIndex[keyText];
+                        
+                        // If we have a last known product/location, try to find it in refs to sync cycle
+                        if (lastProductEditorUri) {
+                            // Find ref matching lastProductEditorUri (and line if possible)
+                            // Ref format: product://SKU@Line:Col/Path
+                            // We need to match SKU (from URI) and Line (from selection)
+                            
+                            // Extract SKU from last URI
+                            // Path: .../db/products/.../SKU/SKU.js or SKU.ID.js
+                            const fsPath = lastProductEditorUri.fsPath;
+                            const pathParts = fsPath.split(path.sep);
+                            // SKU is likely the parent folder name or filename base
+                            // Try to match against refs
+                            
+                            for (let i = 0; i < refStrings.length; i++) {
+                                const r = refStrings[i];
+                                // Parse ref to get SKU and Line
+                                const at = r.indexOf('@');
+                                if (at === -1) continue;
+                                
+                                const refProtocol = 'product:';
+                                let sStart = r.indexOf(refProtocol);
+                                if (sStart !== -1) {
+                                    sStart += refProtocol.length;
+                                    if (r.indexOf('//', sStart) === sStart) sStart += 2;
+                                } else {
+                                    sStart = 0; // Fallback
+                                }
+                                
+                                const rSku = r.substring(sStart, at);
+                                
+                                // Line
+                                const loc = r.substring(at+1);
+                                const slash = loc.indexOf('/');
+                                if (slash === -1) continue;
+                                const lineStr = loc.substring(0, loc.indexOf(':'));
+                                const rLine = parseInt(lineStr);
+                                
+                                // Check if fsPath includes SKU (simple check)
+                                // And line matches lastProductEditorSelection.line + 1
+                                if (lastProductEditorSelection && fsPath.includes(rSku) && (Math.abs(rLine - (lastProductEditorSelection.line + 1)) <= 1)) {
+                                    // Found match! Use this index as current
+                                    currentIndex = i;
+                                    break;
+                                }
+                            }
+                            // Clear it so next cycle uses increment
+                            lastProductEditorUri = null; 
+                            lastProductEditorSelection = null;
+                        }
+
+                        if (currentIndex === undefined || currentIndex === -1) currentIndex = -1;
+                        currentIndex = (currentIndex + 1) % refStrings.length; 
+                        
+                        global.datex2RefIndex[keyText] = currentIndex;
+                        
+                        const ref = refStrings[currentIndex];
+                        
+                        // Parse ref: product://SKU@Line:Col/JsonPath#HtmlPath or product://SKU@Line:Col/JsonPath
+                        const atSplit = ref.indexOf('@');
+                        if (atSplit !== -1) {
+                            const locationPart = ref.substring(atSplit + 1);
+                            
+                            // Find split between Line:Col and Path
+                            const firstSlash = locationPart.indexOf('/');
+                            
+                            if (firstSlash !== -1) {
+                                const lineCol = locationPart.substring(0, firstSlash);
+                                const remainder = locationPart.substring(firstSlash + 1);
+
+                                const [lineStr, colStr] = lineCol.split(':');
+                                let line = parseInt(lineStr);
+                                let col = parseInt(colStr);
+                                
+                                const refProtocol = 'product:';
+                                let skuStart = ref.indexOf(refProtocol);
+                                if (skuStart !== -1) {
+                                    skuStart += refProtocol.length;
+                                    // Handle 'product://' case
+                                    if (ref.substring(skuStart, skuStart + 2) === '//') {
+                                        skuStart += 2;
+                                    }
+                                } else {
+                                    // Fallback or error? Assume start
+                                    skuStart = 0;
+                                }
+
+                                const skuPart = ref.substring(skuStart, atSplit); 
+                                
+                                // We must search for the file as it can be nested in categories
+                                const root = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                                
+                                // Optimized search: Check know paths first if possible?
+                                // No, just use findFiles.
+                                
+                                let targetFileUri = null;
+                                const hashSplit = remainder.indexOf('#');
+                                
+                                if (hashSplit !== -1) {
+                                     // HTML ref: path is after hash
+                                     // Assuming the path after # is relative to the product folder? 
+                                     // Or is it the filename?
+                                     // Let's assume finding the SKU folder is key.
+                                     const relativeHtml = remainder.substring(hashSplit + 1);
+                                     
+                                     // Find SKU folder first
+                                     // Search for SKU.js to locate folder
+                                     const jsFiles = await vscode.workspace.findFiles(new vscode.RelativePattern(root, `db/products/**/${skuPart}.js`), null, 1);
+                                     let skuDir = null;
+                                     if (jsFiles.length > 0) {
+                                         skuDir = path.dirname(jsFiles[0].fsPath);
+                                     } else {
+                                         // try SKU.*.js
+                                         const jsFiles2 = await vscode.workspace.findFiles(new vscode.RelativePattern(root, `db/products/**/${skuPart}.*.js`), null, 1);
+                                         if (jsFiles2.length > 0) skuDir = path.dirname(jsFiles2[0].fsPath);
+                                     }
+                                     
+                                     if (skuDir) {
+                                         // Construct absolute path for HTML
+                                         // relativeHtml might be "subdir/file.html" or just "file.html"
+                                         const absPath = path.join(skuDir, relativeHtml);
+                                         if (fs.existsSync(absPath)) {
+                                             targetFileUri = vscode.Uri.file(absPath);
+                                         } else {
+                                             // Fallback: maybe relativeHtml is just the name?
+                                             // Try joining
+                                         }
+                                     }
+                                } else {
+                                     // JS Ref
+                                     // Search for db/products/**/SKU.js
+                                     const files = await vscode.workspace.findFiles(new vscode.RelativePattern(root, `db/products/**/${skuPart}.js`), null, 1);
+                                     
+                                     if (files.length > 0) {
+                                         targetFileUri = files[0];
+                                     } else {
+                                         // Search for db/products/**/SKU.*.js (e.g. SKU.ID.js)
+                                         const files2 = await vscode.workspace.findFiles(new vscode.RelativePattern(root, `db/products/**/${skuPart}.*.js`), null, 1);
+                                         if (files2.length > 0) {
+                                             targetFileUri = files2[0];
+                                         }
+                                     }
+                                }
+                                
+                                if (targetFileUri) {
+                                    targetUri = targetFileUri;
+                                } else {
+                                    vscode.window.showErrorMessage(`Could not populate ref: File for ${skuPart} not found in db/products.`);
+                                    return; // Stop processing this ref
+                                }
+                                
+                                // Restore horizontal position offset if possible
+                                const currentPos = editor.selection.active;
+                                const currentLineText = editor.document.lineAt(currentPos.line).text;
+                                // Find where key starts in this line ("Key": {)
+                                const keyStart = currentLineText.indexOf('"');
+                                let offset = 0;
+                                if (keyStart !== -1 && currentPos.character > keyStart) {
+                                    offset = currentPos.character - (keyStart + 1); // +1 for quote
+                                    if (offset < 0) offset = 0;
+                                }
+                                
+                                // Apply offset to target Col
+                                col = col + offset;
+                                
+                                targetSelection = new vscode.Position(line - 1, col - 1);
+                            }
+                        }
+                    }
+                }
+                
+                try {
+                     const doc = await vscode.workspace.openTextDocument(targetUri);
+                     const ed = await vscode.window.showTextDocument(doc);
+                     if (targetSelection) {
+                         ed.selection = new vscode.Selection(targetSelection, targetSelection);
+                         ed.revealRange(new vscode.Range(targetSelection, targetSelection), vscode.TextEditorRevealType.InCenter);
+                     }
+                } catch(e) {
+                     vscode.window.showErrorMessage('Could not follow ref: ' + e.message);
+                }
+            } else {
+                // We are in source, switch to cache
+                if (editor) {
+                    lastProductEditorUri = editor.document.uri;
+                    lastProductEditorSelection = editor.selection.active;
+                }
+                
+                if (!fs.existsSync(cachePath)) {
+                    vscode.window.showErrorMessage('Translation cache file not found.');
+                    return;
+                }
+
+                // 1. Identify text to search
+                const selection = editor.selection.active;
+                const lineIdx = selection.line;
+                const currentLineText = document.lineAt(lineIdx).text;
+                
+                let searchText = null;
+                
+                // Try to extract string under cursor first
+                const wordRange = document.getWordRangeAtPosition(selection, /(["'])((?:(?!\1)[^\\]|\\.)*?)\1/);
+                if (wordRange) {
+                    const text = document.getText(wordRange);
+                    // Strip quotes
+                    searchText = text.substring(1, text.length - 1);
+                } else {
+                     // Try to parse line for value
+                     const kv = getKeyVal(currentLineText);
+                     if (kv.val) searchText = kv.val;
+                }
+
+                const doc = await vscode.workspace.openTextDocument(cachePath);
+                
+                if (searchText) {
+                     // 2. Search in cache file
+                     // Cache keys are the text itself (usually English text)
+                     
+                     // Helper: Find exact key in JSON
+                     const findKeyOffset = (text, keysToFind) => {
+                         for (const key of keysToFind) {
+                             const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                             // Look for "KEY": start of object
+                             const regex = new RegExp(`^\\s*"${escaped}"\\s*:`, 'm');
+                             const match = regex.exec(text);
+                             if (match) return match.index;
+                         }
+                         return -1;
+                     };
+                     
+                     const cacheContent = doc.getText();
+                     // Try: exact, trimmed, trimmed + space
+                     const candidates = [searchText, searchText.trim(), searchText.trim() + " "];
+                     // Deduplicate
+                     const uniqueCandidates = [...new Set(candidates)];
+                     
+                     const foundOffset = findKeyOffset(cacheContent, uniqueCandidates);
+                     
+                     const targetEditor = await vscode.window.showTextDocument(doc);
+                     
+                     if (foundOffset !== -1) {
+                         const pos = doc.positionAt(foundOffset);
+                         // Select the line or just the key?
+                         // Let's select the key string
+                         const lineText = doc.lineAt(pos.line).text;
+                         const keyStart = lineText.indexOf('"');
+                         if (keyStart !== -1) {
+                              const keyEnd = lineText.indexOf('"', keyStart + 1);
+                              if (keyEnd !== -1) {
+                                  // Select the key content
+                                  const startPos = new vscode.Position(pos.line, keyStart + 1);
+                                  const endPos = new vscode.Position(pos.line, keyEnd);
+                                  targetEditor.selection = new vscode.Selection(startPos, endPos);
+                              } else {
+                                  targetEditor.selection = new vscode.Selection(pos, pos);
+                              }
+                         } else {
+                              targetEditor.selection = new vscode.Selection(pos, pos);
+                         }
+                         
+                         targetEditor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+                     } else {
+                         vscode.window.showInformationMessage(`Translation entry "${searchText}" not found in cache.`);
+                     }
+                } else {
+                    await vscode.window.showTextDocument(doc);
+                }
+            }
+        } catch (e) {
+            console.error(e);
+            vscode.window.showErrorMessage("Error in toggleTranslationFile: " + e.message);
+        }
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleProductFile', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        const currentPath = editor.document.fileName;
+        const dir = path.dirname(currentPath);
+        
+        // Strategy: Look for [DIR_NAME].js in the current directory or parents
+        // We assume structure .../products/CATEGORY/SKU/SKU.js
+        
+        let skuDir = dir;
+        let skuName = path.basename(skuDir);
+        let jsFile = path.join(skuDir, skuName + '.js');
+
+        // Verify we are in a likely product path?
+        if (!currentPath.includes('products')) {
+             // Maybe try to find generic companion? 
+             // Logic: file.js <-> file.html <-> file.css
+             const ext = path.extname(currentPath);
+             const base = path.basename(currentPath, ext);
+             
+             if (ext === '.js') {
+                 // try html
+                 const html = path.join(dir, base + '.html');
+                 if (fs.existsSync(html)) {
+                     const doc = await vscode.workspace.openTextDocument(html);
+                     await vscode.window.showTextDocument(doc);
+                     return;
+                 }
+                 const css = path.join(dir, base + '.css');
+                 if (fs.existsSync(css)) {
+                     const doc = await vscode.workspace.openTextDocument(css);
+                     await vscode.window.showTextDocument(doc);
+                     return;
+                 }
+             } else {
+                 // try js
+                 const js = path.join(dir, base + '.js');
+                 if (fs.existsSync(js)) {
+                     const doc = await vscode.workspace.openTextDocument(js);
+                     await vscode.window.showTextDocument(doc);
+                     return;
+                 }
+             }
+             return;
+        }
+
+        // We are in products
+        if (currentPath.toLowerCase() === jsFile.toLowerCase()) {
+            // Toggle to HTML if exists
+            const htmlFile = path.join(skuDir, skuName + '.html');
+             if (fs.existsSync(htmlFile)) {
+                 const doc = await vscode.workspace.openTextDocument(htmlFile);
+                 await vscode.window.showTextDocument(doc);
+             } else {
+                 // Try thumbs.json
+                  const thumbsFile = path.join(skuDir, 'thumbs.json');
+                  if (fs.existsSync(thumbsFile)) {
+                     const doc = await vscode.workspace.openTextDocument(thumbsFile);
+                     await vscode.window.showTextDocument(doc);
+                  }
+             }
+        } else {
+            // Go to JS
+             if (fs.existsSync(jsFile)) {
+                 const doc = await vscode.workspace.openTextDocument(jsFile);
+                 await vscode.window.showTextDocument(doc);
+             } else {
+                 // Maybe we are in a subfolder or something? 
+                 // Try walking up one level
+                 const parentDir = path.dirname(skuDir);
+                 const parentName = path.basename(parentDir);
+                 const parentJs = path.join(parentDir, parentName + '.js');
+                 if (fs.existsSync(parentJs)) {
+                      const doc = await vscode.workspace.openTextDocument(parentJs);
+                      await vscode.window.showTextDocument(doc);
+                 }
+             }
+        }
+    }));
 
     // Initial update
     updateStatusBar();
@@ -664,7 +1283,7 @@ function activate(context) {
                     const sortedLangs = ["en", "ro", "fr", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "hr", "hu", "is", "it", "ja", "lt", "lv", "nl", "no", "pl", "pt", "sk", "sl", "sv", "zh"];
                     const obj = { refs: [] };
                     sortedLangs.forEach(lang => {
-                        obj[lang] = (lang === 'en') ? enText : "";
+                        obj[lang] = (lang === 'en') ? enText : enText.trim();
                     });
                     // Only add ref if available
                     if (newRef) {
@@ -766,6 +1385,9 @@ function activate(context) {
     cacheWatcher.onDidCreate(updateStatusBar);
     cacheWatcher.onDidDelete(updateStatusBar);
     context.subscriptions.push(cacheWatcher);
+    
+    // Initial update
+    updateStatusBar();
     
     // --- End Translation Status Bar Logic ---
 
@@ -968,23 +1590,25 @@ function activate(context) {
                 } else if (type === 'product') {
                     const codeOrSlug = hostPart;
                     if (codeOrSlug) {
+                        const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
+                        
                         if (htmlPath) {
-                             targetPath = `db/products/${codeOrSlug}/${htmlPath}`;
-                             targetLine = 1; targetCol = 1;
+                             // Look up JS file to get folder
+                             const jsPath = global.datex2ProductMap && global.datex2ProductMap[codeOrSlug];
+                             if (jsPath && rootPath) {
+                                 const folder = path.dirname(jsPath);
+                                 // Construct absolute then relative
+                                 const absHtml = path.join(folder, htmlPath);
+                                 if (fs.existsSync(absHtml)) {
+                                     targetPath = path.relative(rootPath, absHtml);
+                                     targetLine = 1; targetCol = 1;
+                                 }
+                             }
                         } else {
-                            // Link to Product JS: Discover file (slug.ID.js or slug.js)
-                            const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
-                            if (rootPath) {
-                                const productDir = path.join(rootPath, 'db/products', codeOrSlug);
-                                if (fs.existsSync(productDir)) {
-                                    const files = fs.readdirSync(productDir);
-                                    const targetFile = files.find(f => f.match(new RegExp(`^${codeOrSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.\\d+\\.js$`))) || `${codeOrSlug}.js`;
-                                    targetPath = `db/products/${codeOrSlug}/${targetFile}`;
-                                    // Verify existence?
-                                    if (!fs.existsSync(path.join(productDir, targetFile))) targetPath = null;
-                                } else {
-                                    targetPath = null;
-                                }
+                            // Link to Product JS
+                            const jsPath = global.datex2ProductMap && global.datex2ProductMap[codeOrSlug];
+                            if (jsPath && rootPath) {
+                                targetPath = path.relative(rootPath, jsPath);
                             }
                         }
                     }
@@ -1119,6 +1743,9 @@ function activate(context) {
                        addLink(start, end, vscode.Uri.file(resolved), `Reveal File`);
                   }
             }
+
+
+
 
             return links;
         }
@@ -2355,7 +2982,8 @@ function activate(context) {
     }));
 
     // --- Translation Toggle Logic (Ctrl+F12) ---
-    context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleTranslationFile', async () => {
+    /* context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleTranslationFile', async () => {
+        try {
         const editor = vscode.window.activeTextEditor;
         if (!editor) return;
 
@@ -2366,7 +2994,7 @@ function activate(context) {
         const colIdx = selection.character;
         const currentLineText = document.lineAt(lineIdx).text;
 
-        const cacheFilePath = 'website/db/translations/translations.ai.cache.json'; 
+        const cacheFilePath = 'db/translations/translations.ai.cache.json'; 
         
         // Helper to find root dir
         const getRootDir = (startPath) => {
@@ -2387,131 +3015,46 @@ function activate(context) {
 
         // Scenario 1: We are IN the cache file, want to go back to source
         if (filePath.toLowerCase().endsWith('translations.ai.cache.json')) {
-            // Parse current block to find "refs"
-            const lines = document.getText().split(/\r?\n/);
-            // 1. Find the start of the current object block
-            // Simple heuristic used here: look backwards for a line ending in '{' that isn't nested too deep or is a key
-            // A better way with existing helpers: parse lines, get stack.
-            
-            const parsed = parseLines(lines);
-            const stack = getContextStack(parsed, lineIdx, new Map());
-            
-            // In the cache file, structure is usually: "Key": { "lang": "...", "refs": ["path:line"] }
-            // So we look for the 'refs' property in the current block, or if we are on a key, the refs of that key.
-            
-            let refs = [];
-            
-            // Iterate lines forward from current block start to find "refs"
-            // Find the index of the key definition for the current block
-            let blockStartIdx = -1;
-            
-            // If we are inside the object, the stack[0] should be the Key of the translation item
-            // stack[0] -> type: 'scope', key: 'TheTranslationKey'
-            
-            if (stack.length > 0) {
-                const itemKey = stack[0].key;
-                
-                // Scan content of this item for "refs"
-                // We need to find where this item starts in the file. 
-                // The stack creation logic went backwards to find parents.
-                // Let's search forward from the line where the item key was defined.
-                // Re-parsing mostly to find the line number of the key
-                
-                // Optimization: Just search in the local vicinity of the cursor for "refs": [ ... ]
-                // This is a "hacky" but fast search.
-                
-                // Expand search window: 50 lines up and down
-                let startSearch = Math.max(0, lineIdx - 50);
-                let endSearch = Math.min(lines.length, lineIdx + 50);
-                
-                // Find "refs" array
-                for (let i = startSearch; i < endSearch; i++) {
-                    const l = lines[i];
-                    if (l.includes('"refs":')) {
-                        // Found refs start. Parse the JSON array roughly.
-                        // Assuming format: "refs": [ "path:line", ... ]
-                        // It might span multiple lines.
-                        let j = i;
-                        let jsonStr = "";
-                        while (j < endSearch) {
-                            jsonStr += lines[j];
-                            if (lines[j].includes(']')) break;
-                            j++;
-                        }
-                        const refsMatch = jsonStr.match(/"refs"\s*:\s*\[(.*?)\]/s);
-                        if (refsMatch) {
-                            const refsContent = refsMatch[1];
-                            const refItems = refsContent.match(/"([^"]+)"/g);
-                            if (refItems) {
-                                refs = refItems.map(s => s.replace(/"/g, ''));
-                            }
-                        }
-                        if (refs.length > 0) break;
+                // Use helper to resolve refs
+                const refs = getTranslationRefs(document, lineIdx);
+                if (refs.length > 0) {
+                    const locations = await resolveRefsToLocations(refs, rootDir);
+                    
+                    // Smart navigation: Try to match current source file
+                     // Current File Slug
+                    const currentSlug = path.basename(path.dirname(document.fileName));
+                    // Current Line (1-based because refs are 1-based)
+                    const currentLine = selection.active.line + 1;
+                    
+                    let bestLoc = locations[0];
+                    
+                    // Try to find exact match
+                    const exactMatch = locations.find(l => {
+                        const fsPath = l.uri.fsPath;
+                        return path.basename(fsPath) === document.fileName; // simple filename match
+                        // Better: check if fsPath includes currentSlug and line is close?
+                        // Actually, if we are going Cache -> Source, we usually want the FIRST ref or a list.
+                        // But wait, the user said "Toggle". If I am in Cache, Toggle should bring me back to Source.
+                        // If I have multiple sources, which one?
+                        // History based? Or Reference based?
+                        // If we don't have history, maybe just the first one.
+                    });
+                    
+                    if (exactMatch) bestLoc = exactMatch;
+                    
+                    if (bestLoc) {
+                         const doc = await vscode.workspace.openTextDocument(bestLoc.uri);
+                         const editor = await vscode.window.showTextDocument(doc);
+                         editor.selection = new vscode.Selection(bestLoc.range.start, bestLoc.range.end);
+                         editor.revealRange(bestLoc.range, vscode.TextEditorRevealType.InCenter);
+                         return;
                     }
-                }
-            }
-
-            if (refs.length > 0) {
-                // Take the first ref
-                const ref = refs[0]; 
-                
-                let targetSrcPath = null;
-                let refLine = 1;
-                let refCol = 1;
-
-                if (ref.includes('@')) {
-                    // New Format: product:host@line:col/path#html or profile@line:col/path
-                    const regex = /(product):([^@]+)@([^/]+)\/([^#]+)(?:#.*)?|(profile|category)@([^/]+)\/([^#]+)(?:#.*)?/;
-                    const match = ref.match(regex);
-                    if (match) {
-                        let type, host, pos;
-                        if (match[1] === 'product') {
-                            type = 'product';
-                            host = match[2];
-                            pos = match[3];
-                        } else {
-                            type = match[5];
-                            host = '';
-                            pos = match[6];
-                        }
-                        
-                        const posParts = pos.split(':');
-                        if (posParts.length > 0) refLine = parseInt(posParts[0]);
-                        if (posParts.length > 1) refCol = parseInt(posParts[1]);
-                        
-                        if (type === 'product') {
-                             targetSrcPath = path.join(rootDir, `db/products/${host}/${host}.js`);
-                        } else if (type === 'category') {
-                             targetSrcPath = path.join(rootDir, 'db/categories/categories.js');
-                        } else if (type === 'profile') {
-                             targetSrcPath = path.join(rootDir, 'db/profile/profile.js');
-                        }
-                    }
-                } else if (ref.includes('://')) {
-                    // URL Format (Legacy): type://host@line:col/path#html
-                    const regex = /(product|category|profile):\/\/([^@]*)@([^/]+)\/([^#]+)(?:#.*)?/;
-                    // Legacy Format: path:line
-                    const parts = ref.split(':');
-                    const refPathRel = parts[0];
-                    refLine = parts.length > 1 ? parseInt(parts[1]) : 1;
-                    targetSrcPath = path.join(rootDir, refPathRel);
-                }
-                
-                if (targetSrcPath && fs.existsSync(targetSrcPath)) {
-                    const doc = await vscode.workspace.openTextDocument(targetSrcPath);
-                    const editor = await vscode.window.showTextDocument(doc);
-                    const pos = new vscode.Position(refLine - 1, refCol - 1);
-                    editor.selection = new vscode.Selection(pos, pos);
-                    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
-                    return;
                 } else {
-                    vscode.window.showWarningMessage(`Reference file not found or invalid format: ${ref}`);
+                     vscode.window.showInformationMessage("No references found for this translation entry.");
+                     return;
                 }
-            } else {
-                vscode.window.showInformationMessage("No references found for this translation entry.");
             }
-
-        } else {
+            
             // Scenario 2: We are in a SOURCE file, want to go to cache
             // 1. Identify the text to search. 
             //    - If cursor is inside a string value, use that string.
@@ -2559,7 +3102,7 @@ function activate(context) {
             
             // Escape regex special chars in searchText
             const escapedSearch = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const searchRegex = new RegExp(`^\\s*"${escapedSearch}"\\s*:`);
+            const searchRegex = new RegExp(`^\\s*"${escapedSearch} ?"\\s*:`);
             
             let foundLine = -1;
             for (let i = 0; i < cacheLines.length; i++) {
@@ -2572,23 +3115,192 @@ function activate(context) {
             if (foundLine !== -1) {
                 const doc = await vscode.workspace.openTextDocument(absoluteCachePath);
                 const editor = await vscode.window.showTextDocument(doc);
-                const pos = new vscode.Position(foundLine, 0);
+                
+                let targetCol = 0;
+                try {
+                    // Calculate offset if we came from a string match
+                    if (wordRange && selection) {
+                        const relativeOffset = selection.character - wordRange.start.character;
+                        const targetLineText = cacheLines[foundLine];
+                        if (targetLineText) {
+                            // Find start of key string in target line (first quote)
+                            const quoteStart = targetLineText.indexOf('"');
+                            if (quoteStart !== -1) {
+                                targetCol = quoteStart + relativeOffset;
+                                // Boundary check: don't go past the line length
+                                if (targetCol > targetLineText.length) targetCol = targetLineText.length;
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.error("Error calculating target cursor position:", err);
+                    targetCol = 0; // Fallback to start of line
+                }
+
+                const pos = new vscode.Position(foundLine, targetCol);
                 editor.selection = new vscode.Selection(pos, pos);
                 editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
             } else {
                 vscode.window.showInformationMessage(`Translation entry "${searchText}" not found in cache.`);
             }
         }
-    }));
+        } catch (e) {
+            vscode.window.showErrorMessage('Toggle Translation Error: ' + e.message);
+            console.error(e);
+        }
+    })); */
 
-    // --- Cursor Preservation for External Reloads ---
-    const lastSelections = new Map(); // fileName (lowercase) -> Position
+    // --- Helper Functions for Refs ---
+    function getTranslationRefs(document, lineIdx) {
+        const text = document.getText();
+        const lines = text.split(/\r?\n/);
+        
+        // Find the block corresponding to the line.
+        // We look for the closest "refs": [...] block downwards, or upwards if we are inside a block.
+        // Simplified: Search window around cursor.
+        
+        let startSearch = Math.max(0, lineIdx - 100);
+        let endSearch = Math.min(lines.length, lineIdx + 100);
+        
+        let refs = [];
+        let jsonStr = "";
+        let collecting = false;
+        
+        // Strategy: Find the start of the object definition for this key, then find "refs" inside it.
+        // Or naively find the closest "refs" block that seems to belong to the current indentation context.
+        
+        // Better: Identify the range of the current key-value pair in JSON.
+        // Since it's a huge JSON, parsing whole file is slow.
+        // We rely on the structure:
+        // "Key": {
+        //    "refs": [ ... ]
+        // }
+        
+        // Scan downwards for "refs":
+        for (let i = lineIdx; i < endSearch; i++) {
+             if (lines[i].includes('"refs":')) {
+                 collecting = true;
+                 startSearch = i;
+                 break;
+             }
+             // If we hit a new Top Level Key (starts with non-space or just indentation and "Key": {), stop.
+             if (i > lineIdx && /^\s*"[^"]+":\s*\{/.test(lines[i])) return [];
+        }
+        
+        // Check upwards if not found downwards (maybe we are INSIDE the refs list)
+        if (!collecting) {
+            for (let i = lineIdx; i >= startSearch; i--) {
+                if (lines[i].includes('"refs":')) {
+                    collecting = true;
+                    startSearch = i;
+                    break;
+                }
+                 if (/^\s*"[^"]+":\s*\{/.test(lines[i])) break; // Hit start of block
+            }
+        }
 
-    context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(e => {
-        if (e.selections.length > 0 && e.textEditor.document.fileName.includes('products') && e.textEditor.document.fileName.endsWith('.js')) {
-            lastSelections.set(e.textEditor.document.fileName.toLowerCase(), e.selections[0].active);
+        if (collecting) {
+             let j = startSearch;
+             while (j < endSearch) {
+                 jsonStr += lines[j];
+                 if (lines[j].includes(']')) break;
+                 j++;
+             }
+             const refsMatch = jsonStr.match(/"refs"\s*:\s*\[(.*?)\]/s);
+             if (refsMatch) {
+                const refsContent = refsMatch[1];
+                const refItems = refsContent.match(/"([^"]+)"/g);
+                if (refItems) {
+                    refs = refItems.map(s => s.replace(/"/g, ''));
+                }
+             }
+        }
+        return refs;
+    }
+
+    async function resolveRefsToLocations(refs, rootDir) {
+        const locations = [];
+        
+        // Cache found files to speed up multiple refs to same file
+        const fileCache = new Map();
+
+        for (const ref of refs) {
+            let targetSrcPath = null;
+            let refLine = 1;
+            let refCol = 1;
+
+            if (ref.includes('@')) {
+                const regex = /(product):([^@]+)@([^/]+)\/([^#]+)(?:#.*)?|(profile|category)@([^/]+)\/([^#]+)(?:#.*)?/;
+                const match = ref.match(regex);
+                if (match) {
+                    let type, host, pos;
+                    if (match[1] === 'product') {
+                         type = 'product';
+                         host = match[2];
+                         pos = match[3];
+                    } else {
+                         type = match[5];
+                         host = '';
+                         pos = match[6];
+                    }
+                    
+                    const posParts = pos.split(':');
+                    if (posParts.length > 0) refLine = parseInt(posParts[0]);
+                    if (posParts.length > 1) refCol = parseInt(posParts[1]);
+                    
+                    if (type === 'product') {
+                         if (fileCache.has(host)) {
+                             targetSrcPath = fileCache.get(host);
+                         } else {
+                            const found = await vscode.workspace.findFiles(`db/products/**/${host}*.js`, '**/node_modules/**', 1);
+                            if (found.length > 0) {
+                                targetSrcPath = found[0].fsPath;
+                                fileCache.set(host, targetSrcPath);
+                            } else {
+                                targetSrcPath = path.join(rootDir, `db/products/${host}/${host}.js`);
+                            }
+                         }
+                    } else if (type === 'category') {
+                         targetSrcPath = path.join(rootDir, 'db/categories/categories.js');
+                    } else if (type === 'profile') {
+                         targetSrcPath = path.join(rootDir, 'db/profile/profile.js');
+                    }
+                }
+            } else if (ref.includes('://')) {
+                 const parts = ref.split(':');
+                 const refPathRel = parts[0];
+                 refLine = parts.length > 1 ? parseInt(parts[1]) : 1;
+                 targetSrcPath = path.join(rootDir, refPathRel);
+            }
+            
+            if (targetSrcPath && fs.existsSync(targetSrcPath)) {
+                // Ensure line is valid
+                const safeLine = refLine > 0 ? refLine - 1 : 0;
+                const safeCol = refCol > 0 ? refCol - 1 : 0;
+                locations.push(new vscode.Location(
+                    vscode.Uri.file(targetSrcPath),
+                    new vscode.Range(safeLine, safeCol, safeLine, safeCol)
+                ));
+            }
+        }
+        return locations;
+    }
+
+    // --- Provider for Ctrl+Shift+F12 ---
+    context.subscriptions.push(vscode.languages.registerImplementationProvider({ scheme: 'file', language: 'json', pattern: '**/translations.ai.cache.json' }, {
+        async provideImplementation(document, position, token) {
+             const refs = getTranslationRefs(document, position.line);
+             if (!refs || refs.length === 0) return null;
+             
+             // Get Root
+             const rootDir = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0 
+                ? vscode.workspace.workspaceFolders[0].uri.fsPath 
+                : path.dirname(document.fileName); // fallback
+             
+             return await resolveRefsToLocations(refs, rootDir);
         }
     }));
+
 
     // context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => {
     //     const doc = e.document;
@@ -2627,7 +3339,7 @@ function activate(context) {
     //              editor.revealRange(new vscode.Range(newPos, newPos), vscode.TextEditorRevealType.InCenter);
     //          }
     //     }, 150); // Increased delay
-    // }));
+
 
 
     // --- Image Preview & Open Logic for Thumbnails ---
@@ -3085,6 +3797,206 @@ function activate(context) {
         }
     }));
 
+    // 15. Definition Provider (Ctrl+Click)
+    context.subscriptions.push(vscode.languages.registerDefinitionProvider(['javascript', 'json'], {
+        async provideDefinition(document, position, token) {
+            const range = document.getWordRangeAtPosition(position, /\b\d{8,12}\b/);
+            if (!range) return null;
+            const id = document.getText(range);
+            
+            // 1. Try Product File
+            let pPath = null;
+            // Check Global Map
+            if (global.datex2ProductMap && global.datex2ProductMap[id]) {
+                pPath = global.datex2ProductMap[id];
+            } else {
+                 // Check Heuristic Search
+                const pFiles = await vscode.workspace.findFiles(`db/products/**/*.${id}.js`, '**/node_modules/**', 1);
+                if (pFiles.length > 0) pPath = pFiles[0].fsPath;
+            }
+            
+            if (pPath) {
+                 return new vscode.Location(vscode.Uri.file(pPath), new vscode.Position(0, 0));
+            }
+            
+            // 2. Try Category & Types (Workspace Root context)
+            const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : null;
+            if (rootPath) {
+                // Category
+                const catPath = path.join(rootPath, 'db/categories/categories.js');
+                if (fs.existsSync(catPath)) {
+                    try {
+                        const content = fs.readFileSync(catPath, 'utf8');
+                        const regex = new RegExp(`(?:["']?)\\bid\\b(?:["']?)\\s*:\\s*${id}\\b`); // Matches id: 123...
+                        const match = regex.exec(content);
+                        if (match) {
+                            const lines = content.substring(0, match.index).split('\n');
+                            const line = lines.length - 1; 
+                            return new vscode.Location(vscode.Uri.file(catPath), new vscode.Position(line, 0));
+                        }
+                    } catch(e) {}
+                }
+                
+                // Types
+                const typesPath = path.join(rootPath, 'db/types/types.js');
+                if (fs.existsSync(typesPath)) {
+                     try {
+                        const content = fs.readFileSync(typesPath, 'utf8');
+                        const regex = new RegExp(`(?:["']?)\\bid\\b(?:["']?)\\s*:\\s*${id}\\b`);
+                        const match = regex.exec(content);
+                        if (match) {
+                            const lines = content.substring(0, match.index).split('\n');
+                            const line = lines.length - 1;
+                            return new vscode.Location(vscode.Uri.file(typesPath), new vscode.Position(line, 0));
+                        }
+                    } catch(e) {}
+                }
+            }
+            
+            return null;
+        }
+    }));
+
+    // 14. Product ID Hover Provider
+    context.subscriptions.push(vscode.languages.registerHoverProvider(['javascript', 'json'], {
+        async provideHover(document, position, token) {
+            const range = document.getWordRangeAtPosition(position, /\b\d{8,12}\b/);
+            if (!range) return null;
+            
+            const id = document.getText(range);
+            
+            // Resolve File Path
+            let targetPath = null;
+            
+            // 1. Try Global Map first
+            if (global.datex2ProductMap && global.datex2ProductMap[id]) {
+                targetPath = global.datex2ProductMap[id];
+            }
+            
+            // 2. Try Heuristic Search if not in map
+            if (!targetPath) {
+                const results = await vscode.workspace.findFiles(`db/products/**/*.${id}.js`, '**/node_modules/**', 1);
+                if (results.length > 0) targetPath = results[0].fsPath;
+            }
+
+            if (!targetPath || !fs.existsSync(targetPath)) return null;
+
+            try {
+                const content = fs.readFileSync(targetPath, 'utf8');
+                
+                // Parse Product Data using VM for safety/robustness
+                const sandbox = { module: {}, exports: {}, require: () => {} };
+                vm.createContext(sandbox);
+                // Wrap in try-catch for VM execution (in case of undefined vars like 'load')
+                // We mock 'load' if it exists to avoid errors
+                sandbox.load = () => ""; 
+                
+                try {
+                    vm.runInContext(content, sandbox);
+                } catch(e) { /* ignore runtime errors in script, we just want data structure if possible */ }
+                
+                const product = sandbox.module.exports || sandbox.exports || sandbox.product;
+                
+                if (!product) return null; // Parse failed
+
+                // --- Extract Data ---
+                // Handle '+' in slug if needed? User says internal is '+', URL might differ?
+                // User said: "URL rewriting middleware that translates '+' to '➕'"
+                // So dev site likely uses '➕' or encoded '+'?
+                // Let's use customSlug as is for now.
+                const slug = product.customSlug || "unknown-slug";
+                const name = product.name || "Unknown Name";
+                const seoTitle = product.seoTitle || name;
+                const seoDesc = product.seoDescription || "";
+                
+                // --- Price Calculation ---
+                let price = parseFloat(product.price) || 0;
+                if (product.options && Array.isArray(product.options)) {
+                    for (const opt of product.options) {
+                        const defIdx = opt.defaultChoice;
+                        if (typeof defIdx === 'number' && opt.choices && opt.choices[defIdx]) {
+                            const choicePrice = parseFloat(opt.choices[defIdx].price) || 0;
+                            price += choicePrice;
+                        }
+                    }
+                }
+                
+                // --- Images ---
+                const images = [];
+                if (product.thumbs) {
+                    // Flatten values
+                    Object.values(product.thumbs).forEach(arr => {
+                       if (Array.isArray(arr)) images.push(...arr);
+                    });
+                }
+                
+                // Resolve Images
+                const mdImages = [];
+                const workspaceRoot = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
+                
+                for (let i = 0; i < Math.min(images.length, 2); i++) {
+                    const imgPathRel = images[i];
+                    let imgUri = null;
+                    
+                    // Strategy 1: Relative to product file
+                    const prodDir = path.dirname(targetPath);
+                    const p1 = path.join(prodDir, imgPathRel);
+                    
+                    // Strategy 2: Check workspace (naive glob search if needed, but slow? Let's try exact path relative to root if logical)
+                    // Image paths like 'thumbs/...' might be in 'db/products/.../thumbs/...' 
+                    // which is covered by p1 if product file is in that folder.
+                    
+                    if (fs.existsSync(p1)) {
+                        imgUri = vscode.Uri.file(p1);
+                    } else if (workspaceRoot) {
+                         // Fallback: try finding file with same name in workspace?
+                         // Maybe too aggressive for hover.
+                         // Let's try 'website/dist/css/' + imgPathRel (seoPreview heuristic)
+                         const pDist = path.join(workspaceRoot, 'website', 'dist', 'css', imgPathRel);
+                         if (fs.existsSync(pDist)) imgUri = vscode.Uri.file(pDist);
+                    }
+                    
+                    if (imgUri) {
+                        mdImages.push(`![Thumbnail](${imgUri.toString()}|width=100)`);
+                    }
+                }
+                
+                // --- Build Markdown ---
+                const md = new vscode.MarkdownString();
+                md.supportHtml = true;
+                md.supportThemeIcons = true;
+                md.isTrusted = true;
+                
+                // 1. Links
+                md.appendMarkdown(`**[${slug}](https://dev.datex2.bike/products/${slug})**  \n`);
+                md.appendMarkdown(`[${name}](https://my.ecwid.com/store/36380184#product:id=${id})  \n\n`);
+                
+                // 2. Price
+                md.appendMarkdown(`**PRICE with default options:** €${price.toFixed(2)}  \n\n`);
+                
+                // 3. SEO Preview
+                md.appendMarkdown(`**SEO Preview:**  \n`);
+                md.appendMarkdown(`<span style="color:#1a0dab;font-size:16px;">${seoTitle}</span>  \n`);
+                md.appendMarkdown(`<span style="color:#006621;font-size:14px;">https://datex2.bike/products/${slug}</span>  \n`);
+                md.appendMarkdown(`<span style="color:#545454;font-size:13px;">${seoDesc}</span>  \n\n`);
+                
+                // 4. Images
+                if (mdImages.length > 0) {
+                    md.appendMarkdown(mdImages.join(' ') + '  \n\n');
+                }
+                
+                // 5. Open File Command
+                // We use command:vscode.open to open the file URI
+                const openCommandUri = vscode.Uri.parse(`command:vscode.open?${encodeURIComponent(JSON.stringify(vscode.Uri.file(targetPath)))}`);
+                md.appendMarkdown(`[$(go-to-file) Open File](${openCommandUri})`);
+
+                return new vscode.Hover(md);
+
+            } catch (e) {
+                return null;
+            }
+        }
+    }));
 
 } // End of activate
 exports.activate = activate;
