@@ -562,18 +562,6 @@ function activate(context) {
         if (typeof suffix !== 'string' || suffix.startsWith('file:') || suffix.includes('/') || suffix.includes('\\')) {
             suffix = null;
         }
-        // Optimization: If suffix is provided (active translation), reuse last known stats
-        // This prevents re-scanning all files every second during polling.
-        // DISABLED per user request to stop flickering text. We always want stable text.
-        /* 
-        if (typeof suffix === 'string' && !suffix.startsWith('file:') && !suffix.includes('/') && !suffix.includes('\\')) {
-             missingItem.text = lastStats.text + suffix;
-             missingItem.color = '#FFA500'; 
-             missingItem.tooltip = lastStats.tooltip;
-             missingItem.show();
-             return;
-        }
-        */
 
         // User requested to ONLY show Cache stats in Status Bar.
         // Scanning product files is deactivated for the status bar count to avoid confusion 
@@ -597,16 +585,6 @@ function activate(context) {
                 }
             }
         }
-
-        /* 
-        // File Content Scanning (Disabled for performance/user preference)
-        for (const file of productFiles) {
-            try {
-                const content = fs.readFileSync(file.fsPath, 'utf8');
-                // ...
-            } catch (e) { console.error(e); }
-        }
-        */
 
         // Check cache file FIRST (Global stats)
         let cacheMissing = 0;
@@ -668,14 +646,33 @@ function activate(context) {
         lastStats.total = combinedTotal;
         lastStats.missing = combinedMissing;
 
-        // Apply suffix if provided (active translation step updates)
+        // --- GUARD: If translation is actively running, do NOT touch the status bar visuals.
+        // updateTranslationProgress() (polling every 1s) is the sole owner of the UI during translation.
+        // Without this guard, cacheWatcher.onDidChange triggers updateStatusBar which overwrites
+        // the "Translating..." + progress bar text, causing a brief flicker/disappearance.
+        // We still updated lastStats above so updateTranslationProgress has fresh numbers.
+        try {
+            const rootPath2 = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+                ? vscode.workspace.workspaceFolders[0].uri.fsPath
+                : null;
+            if (rootPath2) {
+                const statusFile = path.join(rootPath2, '.agent/translation_status.json');
+                if (fs.existsSync(statusFile)) {
+                    const statusContent = fs.readFileSync(statusFile, 'utf8');
+                    const status = JSON.parse(statusContent);
+                    if (status.active) {
+                        // Translation is running - skip visual update, let polling handle it
+                        return;
+                    }
+                }
+            }
+        } catch (e) { /* If status file is unreadable, fall through to normal update */ }
+
+        // --- Normal visual update (only when translation is NOT active) ---
         if (suffix !== undefined && suffix !== null) {
-            // FORCE stable text: spinner + count
-            // We IGNORE the content of suffix for the label to prevent flickering "Starting..." or file paths
             missingItem.text = `$(sync~spin) ${combinedMissing} left / ${combinedTotal}`;
             missingItem.color = '#FFA500';
         } else {
-             // Still show stable text if no update
              if (combinedMissing > 0) {
                  missingItem.text = `$(sync~spin) ${combinedMissing} left / ${combinedTotal}`;
                  missingItem.color = '#FFA500';
