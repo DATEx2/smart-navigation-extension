@@ -29,6 +29,20 @@ function activate(context) {
         fontWeight: 'bold'
     });
 
+    const translatablePropDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#c792ea', // Purple
+        fontWeight: 'bold'
+    });
+
+    const missingValDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#ff5555', // Red
+        fontWeight: 'bold'
+    });
+
+    const validValDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#50fa7b' // Green
+    });
+
     function updateDecorations() {
         const editor = vscode.window.activeTextEditor;
         if (!editor || !['javascript', 'json'].includes(editor.document.languageId)) {
@@ -40,6 +54,7 @@ function activate(context) {
         const attributeRanges = [];
         const categoryRanges = [];
         const lpSelfRanges = [];
+        const translatableRanges = [];
 
         // 0. Self-Referencing LP links (Yellow)
         // Extract current ID from filename: e.g. Product.12345678.js
@@ -141,9 +156,160 @@ function activate(context) {
             }
         }
 
+        // 3. Translatable Properties (Purple)
+        // Scan for keys in profile.js and categories.js
+        if (fileName.includes('profile.js') || fileName.includes('categories.js')) {
+             const translatableKeys = [
+                 'name', 'description', 'seoTitle', 'seoDescription',
+                 'companyName', 'storeName', 'storeDescription',
+                 'rootCategorySeoTitle', 'rootCategorySeoDescription',
+                 'acceptMarketingCheckboxCustomText', 'orderCommentsCaption',
+                 'title', 'text', 'value', 'carrier', 'deliveryTimeDays',
+                 'accountName', 'accountNickName', 'brandName'
+             ];
+             
+             // Regex to find property keys
+             const keysPattern = translatableKeys.join('|');
+             const keysRegex = new RegExp(`(?:["']?)\\b(${keysPattern})\\b(?:["']?)\\s*:`, 'g');
+             
+             let kMatch;
+             while ((kMatch = keysRegex.exec(text))) {
+                  const keyStr = kMatch[1];
+                  const keyStartInMatch = kMatch[0].indexOf(keyStr);
+                  const startPos = editor.document.positionAt(kMatch.index + keyStartInMatch);
+                  const endPos = editor.document.positionAt(kMatch.index + keyStartInMatch + keyStr.length);
+                  translatableRanges.push(new vscode.Range(startPos, endPos));
+             }
+        }
+
+        // 4. Translation Cache Coloring (Keys & Values)
+        if (fileName.endsWith('translations.ai.cache.json') || fileName.endsWith('translations.orphans.json')) {
+             const invalidRanges = [];
+             const validRanges = [];
+             
+             const langs = ['ro', 'fr', 'de', 'es', 'it', 'nl', 'da', 'sv', 'no', 'fi', 'pl', 'cs', 'sk', 'hu', 'bg', 'el', 'hr', 'sl', 'et', 'lv', 'lt', 'is', 'ar', 'ja', 'zh', 'pt'];
+             const mandatoryLangs = new Set(langs);
+
+             let currentKeyRange = null;
+             let currentBlockFoundLangs = new Set();
+             let inBlock = false;
+
+             // Line-by-line parsing
+             for (let i = 0; i < editor.document.lineCount; i++) {
+                 const line = editor.document.lineAt(i);
+                 const text = line.text;
+
+                 // 1. Detect Main KEY Start: "Key": {
+                 // Heuristic: Starts with whitespace, quote, ends with {:
+                 const keyStartMatch = text.match(/^\s*"((?:[^"\\]|\\.)*)"\s*:\s*\{\s*$/);
+                 if (keyStartMatch) {
+                     // Found a Key start
+                     const key = keyStartMatch[1];
+                     
+                     // Find position of the key string (quoted)
+                     // Since regex matched the whole line structure, we can find the first quote
+                     const firstQuoteIdx = text.indexOf('"');
+                     const lastQuoteIdx = text.lastIndexOf('"', text.length - 2); // before the : {
+
+                     if (firstQuoteIdx !== -1 && lastQuoteIdx !== -1) {
+                         const range = new vscode.Range(new vscode.Position(i, firstQuoteIdx), new vscode.Position(i, lastQuoteIdx + 1));
+                         currentKeyRange = range;
+                         currentBlockFoundLangs = new Set();
+                         inBlock = true;
+                     }
+                     continue;
+                 }
+
+                 if (inBlock) {
+                     // 2. Detect Block End: },
+                     if (text.match(/^\s*\},?\s*$/)) {
+                         // End of block - Evaluate Key Completeness
+                         let complete = true;
+                         // Check if we have all mandatory langs
+                         if (currentBlockFoundLangs.size < mandatoryLangs.size) {
+                             complete = false;
+                         }
+
+                         if (currentKeyRange) {
+                             if (complete) {
+                                 validRanges.push(currentKeyRange);
+                             } else {
+                                 invalidRanges.push(currentKeyRange);
+                             }
+                         }
+
+                         inBlock = false;
+                         currentKeyRange = null;
+                         continue;
+                     }
+
+                     // 3. Detect Language Values: "lang": "val"
+                     // Regex to capture Lang and Value
+                     const valMatch = text.match(/^\s*"(\w{2})"\s*:\s*"((?:[^"\\\\]|\\.)*)"/);
+                     if (valMatch) {
+                         const lang = valMatch[1];
+                         const val = valMatch[2];
+                         
+                         // Determine Ranges for Highlighting the ENTRY
+                         const langStartRel = text.indexOf('"' + lang + '"');
+                         const langRange = new vscode.Range(new vscode.Position(i, langStartRel), new vscode.Position(i, langStartRel + lang.length + 2));
+                         
+                         // Value Range: defined by the value capture
+                         // We need robust index finding. valMatch[0] is the whole match.
+                         // The value is at the end of the match.
+                         const fullMatchStr = valMatch[0];
+                         const valQuoteStart = fullMatchStr.lastIndexOf('"' + val + '"'); // This approach is risky if val inside quotes?
+                         // Better: lastIndexOf('"') is the closing quote.
+                         const valEndIdx = fullMatchStr.lastIndexOf('"');
+                         // Start index is valEndIdx - val.length - 1 (opening quote) ?? No, escapes.
+                         // Safer: match indices relative to line.
+                         const valStartInMatch = fullMatchStr.length - 1 - val.length; 
+                         // No, fullMatchStr ends with closing quote.
+                         const matchIndex = text.indexOf(fullMatchStr); // Should be reliable with indentation
+                        
+                         // Construct range for the Value
+                         const valAbsStart = matchIndex + valStartInMatch; // approximate?
+                         // Let's use specific indexes from regex if possible, but JS regex exec gives global match index.
+                         // Re-running exec to get indices?
+                         
+                         // Let's rely on simple string searching *after* the colon.
+                         const colonIdx = text.indexOf(':');
+                         const valStartQuote = text.indexOf('"', colonIdx + 1);
+                         const valEndQuote = text.lastIndexOf('"', text.length - 1); // might be comma at end
+                         // If comma exists, last quote is before it.
+                         // text.lastIndexOf('"') handle cases with trailing comma.
+                         
+                         if (valStartQuote !== -1) {
+                             const valRange = new vscode.Range(new vscode.Position(i, valStartQuote), new vscode.Position(i, valEndQuote + 1));
+                             
+                             // Allow " " (space) as valid translation (meaning same as source)
+                             const isValid = val && val.length > 0;
+                             
+                             if (mandatoryLangs.has(lang)) {
+                                 if (isValid) {
+                                     // validRanges.push(langRange); // User requested standard styling for keys
+                                     validRanges.push(valRange);
+                                     currentBlockFoundLangs.add(lang);
+                                 } else {
+                                     // invalidRanges.push(langRange);
+                                     invalidRanges.push(valRange);
+                                 }
+                             } else {
+                                 if (isValid) validRanges.push(valRange);
+                             }
+                         }
+                     }
+                 }
+             }
+
+             editor.setDecorations(missingValDecorationType, invalidRanges);
+             editor.setDecorations(validValDecorationType, validRanges);
+        }
+
         editor.setDecorations(attributeDecorationType, attributeRanges);
         editor.setDecorations(categoryDecorationType, categoryRanges);
         editor.setDecorations(lpSelfDecorationType, lpSelfRanges);
+        editor.setDecorations(translatablePropDecorationType, translatableRanges);
     }
 
     // Trigger updates
@@ -162,20 +328,195 @@ function activate(context) {
         updateDecorations();
     }
     // --- Translation Status Bar Logic ---
-    const missingItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    const percentItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
+    const missingItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
+    let lastStats = { text: "...", color: "#FFFFFF", tooltip: "", total: 0, missing: 0 };
     context.subscriptions.push(missingItem);
-    context.subscriptions.push(percentItem);
-
-    missingItem.command = 'datex2.showMissingTranslations';
-    percentItem.command = 'datex2.showMissingTranslations';
-    missingItem.tooltip = "Click to go to next missing translation";
-    percentItem.tooltip = "Translation progress";
-
-    missingItem.text = "$(sync~spin) ...";
+    
+    missingItem.text = "$(sync~spin) Initializing...";
+    missingItem.tooltip = "Click to smart action";
     missingItem.show();
-    percentItem.text = "%";
-    percentItem.show();
+    // --- Active Translation Progress Bar ---
+    // Combined into missingItem to ensure they are always together and valid
+    
+    // Command is already registered for logs: datex2.showTranslationLogs
+    // missingItem command is: datex2.showMissingTranslations (shows dropdown/file jump)
+    // We will keep missingItem command as is to allow jumping to missing.
+    // BUT we want to see logs? Maybe a secondary click or just stick to missing jump.
+    // User asked "click pe progress bar sa vedem logurile".
+    // Since we combine them, we have to choose ONE command.
+    // Let's use 'datex2.showMissingTranslations' as primary, but maybe we can add a new command 
+    // that shows a QuickPick: "Show Logs" or "Jump to Next Missing".
+    // OR simpler: separate them by a separator in text but keep same object? No, text is one clickable area.
+    // Let's create a "Smart Click" command that decides what to do or shows options.
+    
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.smartStatusBarClick', async () => {
+         const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+            ? vscode.workspace.workspaceFolders[0].uri.fsPath
+            : null;
+         
+         const statusFile = rootPath ? path.join(rootPath, '.agent/translation_status.json') : null;
+         let isActive = false;
+         if (statusFile && fs.existsSync(statusFile)) {
+             try {
+                 const s = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+                 isActive = s.active;
+             } catch(e){}
+         }
+
+         if (isActive) {
+             // If translating, show logs priority? Or ask?
+             // Let's show Logs directly if active, that matches "click on progress bar".
+             vscode.commands.executeCommand('datex2.showTranslationLogs');
+         } else {
+             // If idle, do the missing jump logic
+            vscode.commands.executeCommand('datex2.showMissingTranslations');
+         }
+    }));
+
+    missingItem.command = 'datex2.smartStatusBarClick';
+    missingItem.priority = 1000; // High priority to stay left-most in its group
+
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.showTranslationLogs', async () => {
+         const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+            ? vscode.workspace.workspaceFolders[0].uri.fsPath
+            : null;
+         if (!rootPath) return;
+         
+         const logPath = path.join(rootPath, '.agent/translation.log');
+         if (fs.existsSync(logPath)) {
+             const doc = await vscode.workspace.openTextDocument(logPath);
+             await vscode.window.showTextDocument(doc); // Open log file
+         } else {
+             vscode.window.showInformationMessage('No translation logs found.');
+         }
+    }));
+
+    function updateTranslationProgress() {
+         const fs = require('fs');
+         const path = require('path');
+         const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+            ? vscode.workspace.workspaceFolders[0].uri.fsPath
+            : null;
+         if (!rootPath) return;
+         
+         const statusFile = path.join(rootPath, '.agent/translation_status.json');
+         
+         // Helper to get base text (missing count)
+         // We need to call updateStatusBar logic but return text instead of setting it?
+         // Or just read the current text of missingItem if meaningful?
+         // Better: Let updateStatusBar handle the "Missing..." part, and we Append to it?
+         // WRONG: updateStatusBar is async and slow-ish (reads many files). 
+         // We don't want to run it every 1s if expensive.
+         // But we MUST update the missing count real-time.
+         // So we MUST run updateStatusBar logic. 
+         
+         // Let's modify updateStatusBar to accept an optional suffix argument.
+         if (fs.existsSync(statusFile)) {
+             try {
+                 const content = fs.readFileSync(statusFile, 'utf8'); 
+                 const status = JSON.parse(content);
+                 
+                 if (status.active) {
+                     // Visual Progress Bar
+                     const barLength = 10;
+                     const filledLength = Math.round((status.percent / 100) * barLength);
+                     const emptyLength = barLength - filledLength;
+                     const barStr = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
+                     const progressText = `${status.current}/${status.total}`;
+                     
+                     const suffix = `   $(sync~spin) ${barStr} ${progressText}`;
+                     
+                     // Real-time update of missing count based on progress
+                     // lastStats.missing is the base count. status.current is items done.
+                     // status.active means we are progressing.
+                     // Note: status.current resets per run? Yes.
+                     // But lastStats might be old if we didn't scan recently.
+                     // Assuming lastStats was accurate before start or updated via file save events.
+                     
+                     let projectedMissing = lastStats.missing;
+                     let projectedPercent = 0;
+                     
+                     if (lastStats.total > 0) {
+                        // If we are translating, "current" items are now NOT missing (or at least processed)
+                        // But wait, status.current includes SKIPPED items?
+                        // The user said: "știm exact câte s-au terminat".
+                        // status.current increments for every key processed.
+                        // So projectedMissing = lastStats.missing - status.current?
+                        // Roughly yes.
+                        projectedMissing = Math.max(0, lastStats.missing - status.current);
+                        projectedPercent = Math.round(((lastStats.total - projectedMissing) / lastStats.total) * 100);
+                     } else {
+                        // Fallback parsing if numbers missing
+                        try {
+                            const parts = lastStats.text.match(/(\d+)\s*\((\d+)%\)/);
+                            if (parts) {
+                                const base = parseInt(parts[1]);
+                                projectedMissing = Math.max(0, base - status.current);
+                                // percent is harder without total.
+                                projectedPercent = parts[2]; // keep old percent approx?
+                            }
+                        } catch(e){}
+                     }
+
+                     let currentItemSnippet = "";
+                     try {
+                         // lastLog format: "Translating item X/Y (KEY...)"
+                         const m = status.lastLog.match(/\((.*?)\)$/);
+                         if (m && m[1]) {
+                             currentItemSnippet = m[1];
+                         } else {
+                             // Fallback if format is different
+                             currentItemSnippet = status.lastLog; 
+                         }
+
+                         // CLEANUP: User requested to remove filenames/paths
+                         if (currentItemSnippet.includes('file:') || currentItemSnippet.includes('/') || currentItemSnippet.includes('\\')) {
+                             currentItemSnippet = "";
+                         }
+
+                         if (currentItemSnippet.length > 20) { // 15 chars requested, giving 20 to be safe/readable
+                             currentItemSnippet = currentItemSnippet.substring(0, 20) + '..';
+                         }
+                     } catch(e) {}
+
+                     const missingText = `${projectedMissing} left / ${lastStats.total}`;
+                     // "în față" -> Leftmost
+                     // Format: "KEY_SNIPPET   MISSING   $(icon) BAR  CUR/TOT"
+                     
+                     // DIRECT UPDATE to bypass updateStatusBar async/disabled logic
+                     // User wants: "Translating...", Progress Bar, Spinner, and "N left / M"
+                     // Format: "$(sync~spin) Translating... [BAR] N left / M"
+                     
+                     missingItem.text = `$(sync~spin) Translating... ${barStr} ${missingText}`;
+                     missingItem.tooltip = `Translating... ${status.percent}%\nDone: ${status.current}/${status.total}\nBase Missing: ${lastStats.missing}`;
+                     missingItem.color = '#FFA500'; 
+                     missingItem.show();
+                 } else {
+                     // Revert using standard update
+                     updateStatusBar(null);
+                 }
+             } catch (e) { 
+                 // If error, ignore
+             }
+         } else {
+             updateStatusBar(null);
+         }
+    }
+
+    // Use polling instead of watcher for reliability with dotfiles
+    const pollingInterval = 1000;
+    const pollingTimer = setInterval(() => {
+        try {
+            updateTranslationProgress();
+        } catch (e) { console.error('Polling error:', e); }
+    }, pollingInterval);
+    
+    context.subscriptions.push({ dispose: () => clearInterval(pollingTimer) });
+    
+    // Initial check
+    updateStatusBar().then(() => {
+        updateTranslationProgress();
+    });
 
     // Helper to extract missing entries from content
     function getMissingEntries(content) {
@@ -216,10 +557,34 @@ function activate(context) {
         return entries.sort((a,b) => a.start - b.start);
     }
 
-    async function updateStatusBar() {
+    async function updateStatusBar(suffix) {
+        // Guard: invalid suffix (e.g. Uri object from file watcher) -> clear it
+        if (typeof suffix !== 'string' || suffix.startsWith('file:') || suffix.includes('/') || suffix.includes('\\')) {
+            suffix = null;
+        }
+        // Optimization: If suffix is provided (active translation), reuse last known stats
+        // This prevents re-scanning all files every second during polling.
+        // DISABLED per user request to stop flickering text. We always want stable text.
+        /* 
+        if (typeof suffix === 'string' && !suffix.startsWith('file:') && !suffix.includes('/') && !suffix.includes('\\')) {
+             missingItem.text = lastStats.text + suffix;
+             missingItem.color = '#FFA500'; 
+             missingItem.tooltip = lastStats.tooltip;
+             missingItem.show();
+             return;
+        }
+        */
+
+        // User requested to ONLY show Cache stats in Status Bar.
+        // Scanning product files is deactivated for the status bar count to avoid confusion 
+        // with unsaved/unfetched local file changes.
+        
+        let total = 0;
+        let missing = 0;
+
+        // Populate global map for fast lookups (refs) - CRITICAL for Ctrl+Click
         const productFiles = await vscode.workspace.findFiles('db/products/**/*.js', '**/node_modules/**');
         
-        // Populate global map for fast lookups (refs)
         global.datex2ProductMap = {};
         for (const file of productFiles) {
             const name = path.basename(file.fsPath, '.js');
@@ -233,63 +598,49 @@ function activate(context) {
             }
         }
 
-        let total = 0;
-        let missing = 0;
-        let cacheMissing = 0;
-        let cacheTotal = 0;
-
+        /* 
+        // File Content Scanning (Disabled for performance/user preference)
         for (const file of productFiles) {
             try {
                 const content = fs.readFileSync(file.fsPath, 'utf8');
-                
-                // Count Totals (Candidates)
-                const baseKeys = ['name', 'seoTitle', 'seoDescription', 'description', 'text', 'value'];
-                const keysPatternStr = `(?:\\w*Translated)|${baseKeys.join('|')}`;
-                const keyPattern = new RegExp(`(?:^|\\s|,|{)(?:["']?)(${keysPatternStr})(?:["']?)\\s*:\\s*(["'])((?:(?!\\2)[^\\\\]|\\\\.)*?)\\2`, 'g');
-                const loadPattern = /load\(\s*(["'])((?:(?!\1)[^\\]|\\.)*?)\1\s*\)/g;
-                
-                let m;
-                while ((m = keyPattern.exec(content)) !== null) {
-                    if(m[3].length > 0) total++;
-                }
-                while ((m = loadPattern.exec(content)) !== null) {
-                     if(m[2].length > 0) total++;
-                }
-
-                // Count Missing
-                const missingEntries = getMissingEntries(content);
-                missing += missingEntries.length;
-
+                // ...
             } catch (e) { console.error(e); }
         }
+        */
 
-        // Check cache file
+        // Check cache file FIRST (Global stats)
+        let cacheMissing = 0;
+        let cacheTotal = 0;
+        
         try {
             const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
                 ? vscode.workspace.workspaceFolders[0].uri.fsPath
                 : '';
+                
             if (rootPath) {
                 const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
                 if (fs.existsSync(cachePath)) {
                     const cacheContent = fs.readFileSync(cachePath, 'utf8');
                     const cacheJson = JSON.parse(cacheContent);
                     const keys = Object.keys(cacheJson);
-                    cacheTotal = keys.length;
+                    
+                    const targetLangs = ['ro', 'fr', 'de', 'es', 'it', 'nl', 'da', 'sv', 'no', 'fi', 'pl', 'cs', 'sk', 'hu', 'bg', 'el', 'hr', 'sl', 'et', 'lv', 'lt', 'is', 'ar', 'ja', 'zh', 'pt'];
+
+                    cacheTotal = keys.length * targetLangs.length;
                     
                     let mCount = 0;
                     for (const k of keys) {
-                        if (!k.endsWith(' ')) {
-                            mCount++;
+                        const v = cacheJson[k];
+                        if (!v || typeof v !== 'object') {
+                             mCount += targetLangs.length;
+                             continue;
                         }
                         
-                        const v = cacheJson[k];
-                        if (v && typeof v === 'object') {
-                            for (const lang of Object.keys(v)) {
-                                if (lang === 'cy' || lang === 'refs') continue;
-                                const t = v[lang];
-                                if (typeof t === 'string' && !t.endsWith(' ')) {
-                                    mCount++;
-                                }
+                        for (const lang of targetLangs) {
+                            const val = v[lang];
+                            // Check if missing or NO trailing space (convention for finished translation)
+                            if (!val || typeof val !== 'string' || !val.endsWith(' ')) {
+                                mCount++;
                             }
                         }
                     }
@@ -297,16 +648,45 @@ function activate(context) {
                 }
             }
         } catch (e) { console.error('Error reading translation cache:', e); }
-
+        
         const combinedTotal = total + cacheTotal;
         const combinedMissing = missing + cacheMissing;
-        const percent = combinedTotal > 0 ? Math.round(((combinedTotal - combinedMissing) / combinedTotal) * 100) : 100;
         
-        missingItem.text = `${combinedMissing} (${percent}%)`; 
-        missingItem.color = combinedMissing > 0 ? '#FFFF00' : '#FFFFFF';
-        missingItem.tooltip = `Products: ${missing} missing, Cache: ${cacheMissing} missing`;
+        let barStr = '';
+        if (combinedMissing > 0 && combinedTotal > 0) {
+            const pct = Math.round(((combinedTotal - combinedMissing) / combinedTotal) * 100);
+            const filled = Math.round((pct / 100) * 10);
+            barStr = '█'.repeat(filled) + '░'.repeat(10 - filled);
+        }
+
+        lastStats.text = combinedMissing === 0 
+            ? `Done! (${combinedTotal})` 
+            : `$(sync~spin) Translating... ${barStr} ${combinedMissing} left / ${combinedTotal}`; 
+
+        lastStats.color = combinedMissing === 0 ? '#00FF00' : '#FFA500';
+        lastStats.tooltip = `Cache: ${cacheMissing} missing / ${cacheTotal} terms`;
+        lastStats.total = combinedTotal;
+        lastStats.missing = combinedMissing;
+
+        // Apply suffix if provided (active translation step updates)
+        if (suffix !== undefined && suffix !== null) {
+            // FORCE stable text: spinner + count
+            // We IGNORE the content of suffix for the label to prevent flickering "Starting..." or file paths
+            missingItem.text = `$(sync~spin) ${combinedMissing} left / ${combinedTotal}`;
+            missingItem.color = '#FFA500';
+        } else {
+             // Still show stable text if no update
+             if (combinedMissing > 0) {
+                 missingItem.text = `$(sync~spin) ${combinedMissing} left / ${combinedTotal}`;
+                 missingItem.color = '#FFA500';
+             } else {
+                 missingItem.text = lastStats.text;
+                 missingItem.color = lastStats.color;
+             }
+        }
+        
+        missingItem.tooltip = lastStats.tooltip + (suffix ? `\nStatus: ${suffix}` : '');
         missingItem.show();
-        percentItem.hide();
     }
 
     // Helper for cache missing entries (keys with no trailing space)
@@ -901,86 +1281,7 @@ function activate(context) {
         }
     }));
 
-    context.subscriptions.push(vscode.commands.registerCommand('datex2.toggleProductFile', async () => {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) return;
 
-        const currentPath = editor.document.fileName;
-        const dir = path.dirname(currentPath);
-        
-        // Strategy: Look for [DIR_NAME].js in the current directory or parents
-        // We assume structure .../products/CATEGORY/SKU/SKU.js
-        
-        let skuDir = dir;
-        let skuName = path.basename(skuDir);
-        let jsFile = path.join(skuDir, skuName + '.js');
-
-        // Verify we are in a likely product path?
-        if (!currentPath.includes('products')) {
-             // Maybe try to find generic companion? 
-             // Logic: file.js <-> file.html <-> file.css
-             const ext = path.extname(currentPath);
-             const base = path.basename(currentPath, ext);
-             
-             if (ext === '.js') {
-                 // try html
-                 const html = path.join(dir, base + '.html');
-                 if (fs.existsSync(html)) {
-                     const doc = await vscode.workspace.openTextDocument(html);
-                     await vscode.window.showTextDocument(doc);
-                     return;
-                 }
-                 const css = path.join(dir, base + '.css');
-                 if (fs.existsSync(css)) {
-                     const doc = await vscode.workspace.openTextDocument(css);
-                     await vscode.window.showTextDocument(doc);
-                     return;
-                 }
-             } else {
-                 // try js
-                 const js = path.join(dir, base + '.js');
-                 if (fs.existsSync(js)) {
-                     const doc = await vscode.workspace.openTextDocument(js);
-                     await vscode.window.showTextDocument(doc);
-                     return;
-                 }
-             }
-             return;
-        }
-
-        // We are in products
-        if (currentPath.toLowerCase() === jsFile.toLowerCase()) {
-            // Toggle to HTML if exists
-            const htmlFile = path.join(skuDir, skuName + '.html');
-             if (fs.existsSync(htmlFile)) {
-                 const doc = await vscode.workspace.openTextDocument(htmlFile);
-                 await vscode.window.showTextDocument(doc);
-             } else {
-                 // Try thumbs.json
-                  const thumbsFile = path.join(skuDir, 'thumbs.json');
-                  if (fs.existsSync(thumbsFile)) {
-                     const doc = await vscode.workspace.openTextDocument(thumbsFile);
-                     await vscode.window.showTextDocument(doc);
-                  }
-             }
-        } else {
-            // Go to JS
-             if (fs.existsSync(jsFile)) {
-                 const doc = await vscode.workspace.openTextDocument(jsFile);
-                 await vscode.window.showTextDocument(doc);
-             } else {
-                 // Maybe we are in a subfolder or something? 
-                 // Try walking up one level
-                 const parentDir = path.dirname(skuDir);
-                 const parentName = path.basename(parentDir);
-                 const parentJs = path.join(parentDir, parentName + '.js');
-                 if (fs.existsSync(parentJs)) {
-                      const doc = await vscode.workspace.openTextDocument(parentJs);
-                      await vscode.window.showTextDocument(doc);
-                 }
-             }
-        }
-    }));
 
     // Initial update
     updateStatusBar();
@@ -1617,17 +1918,42 @@ function activate(context) {
                 if (targetPath) {
                      const rootPath = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
                      if (rootPath) {
-                         const absPath = path.join(rootPath, targetPath);
-                         let targetUri = vscode.Uri.file(absPath);
-                         if (targetLine > 0) {
-                             targetUri = targetUri.with({ fragment: `L${targetLine}${targetCol > 1 ? ','+targetCol : ''}` });
+                     const absPath = path.join(rootPath, targetPath);
+                         
+                         // Smart Navigation: Use command to find property in file dynamically
+                         // match[6] is the property key (e.g. 'seoDescription')
+                         if (jsonPath && jsonPath.trim().length > 0) {
+                             const args = encodeURIComponent(JSON.stringify({
+                                 filePath: absPath,
+                                 line: targetLine,
+                                 col: targetCol,
+                                 prop: jsonPath
+                             }));
+                             const commandUri = vscode.Uri.parse(`command:datex2.smartGoTo?${args}`);
+                             
+                             const matchIndex = match.index; 
+                             const startChar = matchIndex + 1; 
+                             const endChar = matchIndex + fullMatchStr.length - 1;
+                             
+                             // Manual link creation to support command URI
+                             const range = new vscode.Range(document.positionAt(startChar), document.positionAt(endChar));
+                             const link = new vscode.DocumentLink(range, commandUri);
+                             link.tooltip = `Go to '${jsonPath}' in ${path.basename(targetPath)}`;
+                             links.push(link);
+                             
+                         } else {
+                             // Fallback to static line number
+                             let targetUri = vscode.Uri.file(absPath);
+                             if (targetLine > 0) {
+                                targetUri = targetUri.with({ fragment: `L${targetLine}${targetCol > 1 ? ','+targetCol : ''}` });
+                             }
+                             
+                             const matchIndex = match.index; 
+                             const startChar = matchIndex + 1; 
+                             const endChar = matchIndex + fullMatchStr.length - 1;
+                             
+                             addLink(startChar, endChar, targetUri, `Open ${targetPath} at line ${targetLine}:${targetCol}`);
                          }
-                         
-                         const matchIndex = match.index; 
-                         const startChar = matchIndex + 1; 
-                         const endChar = matchIndex + fullMatchStr.length - 1;
-                         
-                         addLink(startChar, endChar, targetUri, `Open ${targetPath} at line ${targetLine}:${targetCol}`);
                      }
                 }
             }
@@ -1817,11 +2143,9 @@ function activate(context) {
             } else if (filePath instanceof vscode.Uri) {
                 targetUri = filePath;
             } else {
-                 // Handle URIs passed as JSON objects (UriComponents) which might happen if args are serialized Uri objects
                  if (filePath.scheme) {
                      targetUri = vscode.Uri.from(filePath);
                  } else {
-                     // Fallback, assume string path if possible or re-wrap
                      targetUri = vscode.Uri.file(String(filePath));
                  }
             }
@@ -1835,6 +2159,42 @@ function activate(context) {
             }
         } catch (e) {
             vscode.window.showErrorMessage(`Failed to open file: ${e.message}`);
+        }
+    }));
+
+    // --- Smart GoTo Command (Finds Property) ---
+    context.subscriptions.push(vscode.commands.registerCommand('datex2.smartGoTo', async (args) => {
+        try {
+            // Args usually come as object if parsed from JSON in URI
+            const { filePath, line, col, prop } = args;
+            if (!filePath) return;
+
+            const doc = await vscode.workspace.openTextDocument(filePath);
+            const editor = await vscode.window.showTextDocument(doc);
+            const text = doc.getText();
+
+            let targetPos = new vscode.Position(line > 0 ? line - 1 : 0, 0);
+
+            // 1. Try to find Property in text
+            if (prop) {
+                // Regex: property key followed by colon.
+                // Tolerates quotes:  "prop":  or  prop:  or  'prop':
+                const regex = new RegExp(`(?:["']?)\\b${prop}\\b(?:["']?)\\s*:`);
+                const match = regex.exec(text);
+                
+                if (match) {
+                    targetPos = doc.positionAt(match.index);
+                } else {
+                    // Fallback: Try finding it in 'exports' or specific patterns if standard KV fails?
+                    // For now, if not found, we fallback to the provided line number (which might be wrong, but better than nothing)
+                }
+            }
+
+            editor.selection = new vscode.Selection(targetPos, targetPos);
+            editor.revealRange(new vscode.Range(targetPos, targetPos), vscode.TextEditorRevealType.InCenter);
+
+        } catch (e) {
+            vscode.window.showErrorMessage(`Smart Nav Failed: ${e.message}`);
         }
     }));
 
@@ -3933,7 +4293,10 @@ function activate(context) {
                 // Resolve Images
                 const mdImages = [];
                 const workspaceRoot = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0].uri.fsPath : '';
-                
+                const config = vscode.workspace.getConfiguration('datex2');
+                const thumbsRegistryPath = config.get('thumbsRegistryPath');
+                let thumbsRoot = thumbsRegistryPath ? path.dirname(thumbsRegistryPath) : null;
+
                 for (let i = 0; i < Math.min(images.length, 2); i++) {
                     const imgPathRel = images[i];
                     let imgUri = null;
@@ -3942,22 +4305,35 @@ function activate(context) {
                     const prodDir = path.dirname(targetPath);
                     const p1 = path.join(prodDir, imgPathRel);
                     
-                    // Strategy 2: Check workspace (naive glob search if needed, but slow? Let's try exact path relative to root if logical)
-                    // Image paths like 'thumbs/...' might be in 'db/products/.../thumbs/...' 
-                    // which is covered by p1 if product file is in that folder.
-                    
                     if (fs.existsSync(p1)) {
                         imgUri = vscode.Uri.file(p1);
                     } else if (workspaceRoot) {
-                         // Fallback: try finding file with same name in workspace?
-                         // Maybe too aggressive for hover.
-                         // Let's try 'website/dist/css/' + imgPathRel (seoPreview heuristic)
-                         const pDist = path.join(workspaceRoot, 'website', 'dist', 'css', imgPathRel);
-                         if (fs.existsSync(pDist)) imgUri = vscode.Uri.file(pDist);
+                         // Strategy 2a: Workspace Root (e.g. d:\work\DATEx2.bike\ww3\thumbs\...)
+                         const pRoot = path.join(workspaceRoot, imgPathRel);
+                         if (fs.existsSync(pRoot)) {
+                             imgUri = vscode.Uri.file(pRoot);
+                         } else {
+                             // Strategy 2b: Website Dist
+                             const pDist = path.join(workspaceRoot, 'website', 'dist', 'css', imgPathRel);
+                             if (fs.existsSync(pDist)) imgUri = vscode.Uri.file(pDist);
+                         }
                     }
                     
+                    // Strategy 3: Thumbs Registry Root
+                    if (!imgUri && thumbsRoot) {
+                         const pReg = path.join(thumbsRoot, imgPathRel);
+                         if (fs.existsSync(pReg)) imgUri = vscode.Uri.file(pReg);
+                    }
+
+                    // Fallback: Remote URL
+                    // If local file not found, use https://dev.datex2.bike/
+                    // imgPathRel is like "thumbs/foo.webp"
                     if (imgUri) {
-                        mdImages.push(`![Thumbnail](${imgUri.toString()}|width=100)`);
+                        mdImages.push(`<img src="${imgUri.toString()}" width="100" />`);
+                    } else {
+                        // Use remote
+                        const remoteUrl = `https://dev.datex2.bike/${imgPathRel}`;
+                        mdImages.push(`<img src="${remoteUrl}" width="100" />`);
                     }
                 }
                 
@@ -3967,23 +4343,71 @@ function activate(context) {
                 md.supportThemeIcons = true;
                 md.isTrusted = true;
                 
-                // 1. Links
-                md.appendMarkdown(`**[${slug}](https://dev.datex2.bike/products/${slug})**  \n`);
-                md.appendMarkdown(`[${name}](https://my.ecwid.com/store/36380184#product:id=${id})  \n\n`);
+                // Layout: Images on Left | Details on Right
+                const imgCell = mdImages.length > 0 ? mdImages.join(' ') : 'No Image';
+                const detailsCell = `**[${slug}](https://dev.datex2.bike/products/${slug})**<br/>` +
+                                    `[${name}](https://my.ecwid.com/store/36380184#product:id=${id})<br/>` +
+                                    `**€${price.toFixed(2)}**`;
                 
-                // 2. Price
-                md.appendMarkdown(`**PRICE with default options:** €${price.toFixed(2)}  \n\n`);
-                
-                // 3. SEO Preview
-                md.appendMarkdown(`**SEO Preview:**  \n`);
-                md.appendMarkdown(`<span style="color:#1a0dab;font-size:16px;">${seoTitle}</span>  \n`);
-                md.appendMarkdown(`<span style="color:#006621;font-size:14px;">https://datex2.bike/products/${slug}</span>  \n`);
-                md.appendMarkdown(`<span style="color:#545454;font-size:13px;">${seoDesc}</span>  \n\n`);
-                
-                // 4. Images
-                if (mdImages.length > 0) {
-                    md.appendMarkdown(mdImages.join(' ') + '  \n\n');
+                md.appendMarkdown(`| | |\n|---|---|\n| ${imgCell} | ${detailsCell} |\n\n`);
+
+                // Resolve Logo
+                let logoUri = '';
+                if (workspaceRoot) {
+                    const logoPath = path.join(workspaceRoot, 'website', 'logo.svg');
+                    if (fs.existsSync(logoPath)) {
+                        logoUri = vscode.Uri.file(logoPath).toString();
+                    }
                 }
+
+                // Truncate Description (Google shows ~155-160 chars)
+                let shortSeoDesc = seoDesc || "";
+                if (shortSeoDesc.length > 155) {
+                    shortSeoDesc = shortSeoDesc.substring(0, 155) + '...';
+                }
+
+                // Extract category path from file path (e.g., batteries-chargers/adapters)
+                let categoryPath = '';
+                if (targetPath && workspaceRoot) {
+                    const relPath = targetPath.replace(workspaceRoot, '').replace(/\\/g, '/');
+                    // Extract path between db/products/ and the product folder
+                    const match = relPath.match(/db\/products\/(.+?)\/[^\/]+\/[^\/]+$/);
+                    if (match && match[1]) {
+                        categoryPath = match[1]; // e.g. "batteries-chargers/adapters"
+                    }
+                }
+
+                // 3. SEO Preview - wrapped in max-width container
+                md.appendMarkdown(`\n\n---\n\n`);
+                md.appendMarkdown(`<div style="max-width:450px;">\n\n`);
+                
+                // Row 1: Logo + Site + URL with categories
+                const logoMd = logoUri ? `![](${logoUri}|height=20)` : '🌐';
+                const urlPath = categoryPath ? `products › ${categoryPath.replace(/\//g, ' › ')} › ${slug.length > 20 ? slug.substring(0,20) + '...' : slug}` : `products › ${slug.length > 25 ? slug.substring(0,25) + '...' : slug}`;
+                md.appendMarkdown(`${logoMd} **DATEx2.bike** · https://datex2.bike › ${urlPath}\n\n`);
+                
+                // Row 2: Title as link (VS Code renders links blue)
+                const fullUrl = categoryPath ? `https://datex2.bike/products/${categoryPath}/${slug}` : `https://datex2.bike/products/${slug}`;
+                md.appendMarkdown(`### [${seoTitle}](${fullUrl})\n\n`);
+                
+                // Row 3: Description with bold first phrase
+                const firstComma = shortSeoDesc.indexOf(',');
+                const firstPeriod = shortSeoDesc.indexOf('.');
+                const splitPoint = (firstComma > 0 && firstComma < 60) ? firstComma : (firstPeriod > 0 && firstPeriod < 80) ? firstPeriod : -1;
+                
+                if (splitPoint > 0) {
+                    const boldPart = shortSeoDesc.substring(0, splitPoint + 1);
+                    const rest = shortSeoDesc.substring(splitPoint + 1);
+                    md.appendMarkdown(`**${boldPart}**${rest}\n\n`);
+                } else {
+                    md.appendMarkdown(`${shortSeoDesc}\n\n`);
+                }
+                
+                // Row 4: Price line (like Google: €755.95 · In stock · etc)
+                md.appendMarkdown(`**€${price.toFixed(2)}** · 🟢 In stock\n\n`);
+                
+                // Close container
+                md.appendMarkdown(`</div>\n\n`);
                 
                 // 5. Open File Command
                 // We use command:vscode.open to open the file URI
@@ -3997,6 +4421,8 @@ function activate(context) {
             }
         }
     }));
+
+
 
 } // End of activate
 exports.activate = activate;
