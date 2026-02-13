@@ -35,12 +35,16 @@ function activate(context) {
     });
 
     const missingValDecorationType = vscode.window.createTextEditorDecorationType({
-        color: '#ff5555', // Red
+        color: '#ff9800' // Orange
+    });
+
+    const manualValDecorationType = vscode.window.createTextEditorDecorationType({
+        color: '#76ff03', // Lime (Same as refs)
         fontWeight: 'bold'
     });
 
     const validValDecorationType = vscode.window.createTextEditorDecorationType({
-        color: '#50fa7b' // Green
+        color: '#34af28' // Darker Green (Standard Valid)
     });
 
     function updateDecorations() {
@@ -89,7 +93,6 @@ function activate(context) {
 
         // Match: attributes: [ ... { id: 12345 ... ]
         // This is harder with pure regex globally. We'll iterate through occurrences of "attributes" and parse somewhat locally or just target specific "id": 123 patterns if context implies.
-        // For robustness without full parser, let's look for "id": 123 patterns inside "attributes" block is tricky.
         // SIMPLIFICATION: Look for any "id": 123 pattern? No, too generic.
         // Let's assume the user format is consistent: { id: 12345, ... } inside arrays.
         // A better heuristic for attributes: standard attribute IDs are often 9 digits starting with 16, 17, 18, 20, 21, 25?? The user's types.js shows 9 digits.
@@ -186,11 +189,13 @@ function activate(context) {
         if (fileName.endsWith('translations.ai.cache.json') || fileName.endsWith('translations.orphans.json')) {
              const invalidRanges = [];
              const validRanges = [];
+             const manualRanges = [];
              
              const langs = ['ro', 'fr', 'de', 'es', 'it', 'nl', 'da', 'sv', 'no', 'fi', 'pl', 'cs', 'sk', 'hu', 'bg', 'el', 'hr', 'sl', 'et', 'lv', 'lt', 'is', 'ar', 'ja', 'zh', 'pt'];
              const mandatoryLangs = new Set(langs);
 
              let currentKeyRange = null;
+             let currentKeyString = null;
              let currentBlockFoundLangs = new Set();
              let inBlock = false;
 
@@ -214,6 +219,7 @@ function activate(context) {
                      if (firstQuoteIdx !== -1 && lastQuoteIdx !== -1) {
                          const range = new vscode.Range(new vscode.Position(i, firstQuoteIdx), new vscode.Position(i, lastQuoteIdx + 1));
                          currentKeyRange = range;
+                         currentKeyString = key;
                          currentBlockFoundLangs = new Set();
                          inBlock = true;
                      }
@@ -231,8 +237,14 @@ function activate(context) {
                          }
 
                          if (currentKeyRange) {
+                             const isKeyManual = currentKeyString && currentKeyString.endsWith('  ');
+                             
                              if (complete) {
-                                 validRanges.push(currentKeyRange);
+                                 if (isKeyManual) {
+                                     manualRanges.push(currentKeyRange);
+                                 } else {
+                                     validRanges.push(currentKeyRange);
+                                 }
                              } else {
                                  invalidRanges.push(currentKeyRange);
                              }
@@ -240,6 +252,7 @@ function activate(context) {
 
                          inBlock = false;
                          currentKeyRange = null;
+                         currentKeyString = null;
                          continue;
                      }
 
@@ -282,20 +295,24 @@ function activate(context) {
                          if (valStartQuote !== -1) {
                              const valRange = new vscode.Range(new vscode.Position(i, valStartQuote), new vscode.Position(i, valEndQuote + 1));
                              
-                             // Allow " " (space) as valid translation (meaning same as source)
-                             const isValid = val && val.length > 0;
+                             // Manual: Ends with 2 spaces
+                             // Valid: Ends with 1 space OR is English (any non-empty)
+                             const isManual = val && val.endsWith('  ');
+                             const isValid = val && val.length > 0 && (val.endsWith(' ') || lang === 'en');
                              
                              if (mandatoryLangs.has(lang)) {
-                                 if (isValid) {
-                                     // validRanges.push(langRange); // User requested standard styling for keys
+                                 if (isManual) {
+                                     manualRanges.push(valRange);
+                                     currentBlockFoundLangs.add(lang);
+                                 } else if (isValid) {
                                      validRanges.push(valRange);
                                      currentBlockFoundLangs.add(lang);
                                  } else {
-                                     // invalidRanges.push(langRange);
                                      invalidRanges.push(valRange);
                                  }
                              } else {
-                                 if (isValid) validRanges.push(valRange);
+                                 if (isManual) manualRanges.push(valRange);
+                                 else if (isValid) validRanges.push(valRange);
                              }
                          }
                      }
@@ -304,6 +321,7 @@ function activate(context) {
 
              editor.setDecorations(missingValDecorationType, invalidRanges);
              editor.setDecorations(validValDecorationType, validRanges);
+             editor.setDecorations(manualValDecorationType, manualRanges);
         }
 
         editor.setDecorations(attributeDecorationType, attributeRanges);
