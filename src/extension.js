@@ -4439,6 +4439,50 @@ function activate(context) {
 
 
 
+    // --- Autocomplete for o-THUMB- classes ---
+    const thumbCompletionProvider = vscode.languages.registerCompletionItemProvider(
+        ['css', 'less', 'scss', 'html', 'javascript', 'typescript', 'vue'],
+        {
+            provideCompletionItems(document, position) {
+                const rootPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+                    ? vscode.workspace.workspaceFolders[0].uri.fsPath
+                    : null;
+
+                if (!rootPath) return undefined;
+                const thumbsDir = path.join(rootPath, 'thumbs');
+
+                return new Promise((resolve) => {
+                    fs.readdir(thumbsDir, (err, files) => {
+                        if (err) {
+                            resolve([]);
+                            return;
+                        }
+
+                        const items = files
+                            .filter(file => /\.(webp|png|jpg|jpeg|gif)$/i.test(file))
+                            .map(file => {
+                                const name = path.basename(file, path.extname(file));
+                                const className = `o-THUMB-${name}`;
+                                const item = new vscode.CompletionItem(className, vscode.CompletionItemKind.Class);
+                                item.detail = 'Thumb Class';
+
+                                // Add preview
+                                const fileUri = vscode.Uri.file(path.join(thumbsDir, file));
+                                const md = new vscode.MarkdownString(`**${className}**\n\n![Preview](${fileUri}|height=100)`);
+                                md.supportHtml = true;
+                                item.documentation = md;
+
+                                return item;
+                            });
+                        resolve(items);
+                    });
+                });
+            }
+        },
+        'o', '-', 'T', 'H', 'U', 'M', 'B' 
+    );
+    context.subscriptions.push(thumbCompletionProvider);
+
 } // End of activate
 exports.activate = activate;
 exports.deactivate = function() {};
