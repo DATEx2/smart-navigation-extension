@@ -614,7 +614,7 @@ function activate(context) {
                 : '';
                 
             if (rootPath) {
-                const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+                const cachePath = path.join(rootPath, 'website/src/db/translations/translations.ai.cache.json');
                 if (fs.existsSync(cachePath)) {
                     const cacheContent = fs.readFileSync(cachePath, 'utf8');
                     const cacheJson = JSON.parse(cacheContent);
@@ -754,7 +754,7 @@ function activate(context) {
             ? vscode.workspace.workspaceFolders[0].uri.fsPath
             : null;
         if (rootPath) {
-            const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+            const cachePath = path.join(rootPath, 'website/src/db/translations/translations.ai.cache.json');
             if (fs.existsSync(cachePath)) {
                 productFiles.push(vscode.Uri.file(cachePath));
             }
@@ -935,7 +935,7 @@ function activate(context) {
                 : null;
             
             if (!rootPath) return;
-            const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+            const cachePath = path.join(rootPath, 'website/src/db/translations/translations.ai.cache.json');
 
             if (!editor) return;
 
@@ -1446,7 +1446,7 @@ function activate(context) {
             const slug = path.basename(path.dirname(doc.fileName));
             if (slug !== path.basename(doc.fileName, '.js')) return;
 
-            const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+            const cachePath = path.join(rootPath, 'website/src/db/translations/translations.ai.cache.json');
             if (!fs.existsSync(cachePath)) return;
 
             // Read & Cleanup Cache
@@ -1550,7 +1550,7 @@ function activate(context) {
 
                 if (!jsFile) return; // Not a product HTML file we recognize
 
-                const cachePath = path.join(rootPath, 'db/translations/translations.ai.cache.json');
+                const cachePath = path.join(rootPath, 'website/src/db/translations/translations.ai.cache.json');
                 const orphanPath = path.join(rootPath, 'db/translations/translations.orphans.json');
                 
                 let cache = {};
@@ -1696,7 +1696,7 @@ function activate(context) {
     }));
 
     // Watch for translation cache changes
-    const cacheWatcher = vscode.workspace.createFileSystemWatcher('**/db/translations/translations.ai.cache.json');
+    const cacheWatcher = vscode.workspace.createFileSystemWatcher('**/website/src/db/translations/translations.ai.cache.json');
     cacheWatcher.onDidChange(updateStatusBar);
     cacheWatcher.onDidCreate(updateStatusBar);
     cacheWatcher.onDidDelete(updateStatusBar);
@@ -3369,7 +3369,7 @@ function activate(context) {
         const colIdx = selection.character;
         const currentLineText = document.lineAt(lineIdx).text;
 
-        const cacheFilePath = 'db/translations/translations.ai.cache.json'; 
+        const cacheFilePath = 'website/src/db/translations/translations.ai.cache.json'; 
         
         // Helper to find root dir
         const getRootDir = (startPath) => {
