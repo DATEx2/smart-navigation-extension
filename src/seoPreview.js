@@ -1,3 +1,11 @@
+// seoPreview.js — seoPreview module.
+//
+// exports: none
+// used_by: none
+// rules:   none
+// agent:   ollama/qwen3.6:35b-a3b-65536 | ollama | 2026-04-29 | codedna-cli | initial CodeDNA annotation pass
+// message: 
+
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
