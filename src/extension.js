@@ -10,7 +10,12 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const cp = require('child_process');
-const imageSize = require('image-size');
+let imageSize = null;
+try {
+    imageSize = require('image-size');
+} catch (e) {
+    /* optional - not bundled */
+}
 const seoPreview = require('./seoPreview');
 const os = require('os');
 const crypto = require('crypto');
@@ -417,6 +422,8 @@ function activate(context) {
          }
     }));
 
+    let lastActiveState = false;
+
     function updateTranslationProgress() {
          const fs = require('fs');
          const path = require('path');
@@ -443,6 +450,7 @@ function activate(context) {
                  const status = JSON.parse(content);
                  
                  if (status.active) {
+                     lastActiveState = true;
                      // Visual Progress Bar
                      const barLength = 10;
                      const filledLength = Math.round((status.percent / 100) * barLength);
@@ -517,14 +525,15 @@ function activate(context) {
                      missingItem.tooltip = `Translating... ${status.percent}%\nDone: ${status.current}/${status.total}\nBase Missing: ${lastStats.missing}`;
                      missingItem.color = '#FFA500'; 
                      missingItem.show();
-                 } else {
-                     // Revert using standard update
-                     updateStatusBar(null);
+                     return;
                  }
              } catch (e) { 
                  // If error, ignore
              }
-         } else {
+         }
+         // Only revert if we were previously active to avoid hammering CPU/disk every second
+         if (lastActiveState) {
+             lastActiveState = false;
              updateStatusBar(null);
          }
     }
@@ -596,18 +605,25 @@ function activate(context) {
         let total = 0;
         let missing = 0;
 
-        // Populate global map for fast lookups (refs) - CRITICAL for Ctrl+Click
-        const productFiles = await vscode.workspace.findFiles('db/products/**/*.js', '**/node_modules/**');
-        
-        global.datex2ProductMap = {};
-        for (const file of productFiles) {
-            const name = path.basename(file.fsPath, '.js');
-            global.datex2ProductMap[name] = file.fsPath;
-            // Handle SKU.id.js -> map SKU to it if not present (heuristic)
-            if (name.match(/\.\d+$/)) {
-                const sku = name.substring(0, name.lastIndexOf('.'));
-                if (!global.datex2ProductMap[sku]) {
-                     global.datex2ProductMap[sku] = file.fsPath;
+        // Populate global map for fast lookups (refs) - CRITICAL for Ctrl+Click (cached)
+        if (!global.datex2ProductMap || Object.keys(global.datex2ProductMap).length === 0) {
+            const rootPathForMap = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+                ? vscode.workspace.workspaceFolders[0].uri.fsPath
+                : '';
+            const pattern = rootPathForMap
+                ? new vscode.RelativePattern(rootPathForMap, '{website/src/db/products,db/products}/**/*.js')
+                : '{website/src/db/products,db/products}/**/*.js';
+            const productFiles = await vscode.workspace.findFiles(pattern, '{**/node_modules/**,.worktrees/**,website/dist/**,media/**}');
+            global.datex2ProductMap = {};
+            for (const file of productFiles) {
+                const name = path.basename(file.fsPath, '.js');
+                global.datex2ProductMap[name] = file.fsPath;
+                // Handle SKU.id.js -> map SKU to it if not present (heuristic)
+                if (name.match(/\.\d+$/)) {
+                    const sku = name.substring(0, name.lastIndexOf('.'));
+                    if (!global.datex2ProductMap[sku]) {
+                         global.datex2ProductMap[sku] = file.fsPath;
+                    }
                 }
             }
         }
